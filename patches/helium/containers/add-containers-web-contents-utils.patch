@@ -1,0 +1,161 @@
+--- /dev/null
++++ b/components/containers/content/DEPS
+@@ -0,0 +1,3 @@
++include_rules = [
++  "+content/public/browser",
++]
+--- /dev/null
++++ b/components/containers/content/browser/BUILD.gn
+@@ -0,0 +1,16 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++static_library("browser") {
++  sources = [
++    "storage_partition_utils.cc",
++    "storage_partition_utils.h",
++  ]
++
++  deps = [
++    "//base",
++    "//components/containers/core/common",
++    "//content/public/browser",
++  ]
++}
+--- /dev/null
++++ b/components/containers/content/browser/storage_partition_utils.cc
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/content/browser/storage_partition_utils.h"
++
++#include "base/check.h"
++#include "components/containers/core/common/container_id.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace containers {
++
++namespace {
++
++class ContainerIdUserData
++    : public content::WebContentsUserData<ContainerIdUserData> {
++ public:
++  ~ContainerIdUserData() override = default;
++
++  const std::string& container_id() const { return container_id_; }
++  void set_container_id(std::string_view container_id) {
++    container_id_ = std::string(container_id);
++  }
++
++ private:
++  friend WebContentsUserData;
++
++  explicit ContainerIdUserData(content::WebContents* web_contents)
++      : content::WebContentsUserData<ContainerIdUserData>(*web_contents) {}
++
++  std::string container_id_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(ContainerIdUserData);
++
++}  // namespace
++
++content::StoragePartitionConfig GetStoragePartitionConfigForContainer(
++    content::BrowserContext* browser_context,
++    std::string_view container_id) {
++  CHECK(IsValidContainerId(container_id));
++  return content::StoragePartitionConfig::Create(
++      browser_context, kContainersStoragePartitionDomain, container_id,
++      /*in_memory=*/false);
++}
++
++std::optional<std::string> GetContainerIdFromStoragePartitionConfig(
++    const content::StoragePartitionConfig& config) {
++  if (config.partition_domain() != kContainersStoragePartitionDomain ||
++      !IsValidContainerId(config.partition_name())) {
++    return std::nullopt;
++  }
++  return config.partition_name();
++}
++
++std::optional<std::string> GetContainerIdForWebContents(
++    content::WebContents* web_contents) {
++  CHECK(web_contents);
++  if (content::StoragePartition* partition =
++          web_contents->GetBrowserContext()->GetStoragePartition(
++              web_contents->GetSiteInstance(), /*can_create=*/false)) {
++    if (auto container_id =
++            GetContainerIdFromStoragePartitionConfig(partition->GetConfig())) {
++      return container_id;
++    }
++  }
++
++  if (auto* user_data = ContainerIdUserData::FromWebContents(web_contents)) {
++    return user_data->container_id();
++  }
++  return std::nullopt;
++}
++
++void SetContainerIdForWebContents(content::WebContents* web_contents,
++                                  std::string_view container_id) {
++  CHECK(IsValidContainerId(container_id));
++  ContainerIdUserData::GetOrCreateForWebContents(web_contents)
++      ->set_container_id(container_id);
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/storage_partition_utils.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "content/public/browser/storage_partition_config.h"
++
++namespace content {
++class BrowserContext;
++class WebContents;
++}  // namespace content
++
++namespace containers {
++
++// Returns the config of the StoragePartition that holds the site data of the
++// container with `container_id`, which must be a valid container id.
++content::StoragePartitionConfig GetStoragePartitionConfigForContainer(
++    content::BrowserContext* browser_context,
++    std::string_view container_id);
++
++// Returns the container id if `config` belongs to a container.
++std::optional<std::string> GetContainerIdFromStoragePartitionConfig(
++    const content::StoragePartitionConfig& config);
++
++// Returns the id of the container `web_contents` belongs to, if any. This
++// reads the StoragePartition of its SiteInstance, and falls back to the id
++// stored by SetContainerIdForWebContents() if the partition doesn't belong to
++// a container, for example in a discarded tab.
++std::optional<std::string> GetContainerIdForWebContents(
++    content::WebContents* web_contents);
++
++// Remembers that `web_contents` belongs to the container with `container_id`.
++void SetContainerIdForWebContents(content::WebContents* web_contents,
++                                  std::string_view container_id);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
