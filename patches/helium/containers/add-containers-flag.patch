@@ -1,0 +1,171 @@
+--- a/chrome/browser/helium_flag_choices.h
++++ b/chrome/browser/helium_flag_choices.h
+@@ -38,6 +38,8 @@ constexpr const char kHeliumNoiseAudioCo
+ constexpr const char kHeliumNoiseCpuCoresCommandLine[] =
+     "helium-noise-hw-concurrency";
+ 
++constexpr const char kHeliumContainersCommandLine[] = "helium-containers";
++
+ constexpr const char kDisableEchCommandLine[] = "disable-ech";
+ constexpr const char kHeliumSplitClientHelloCommandLine[] =
+     "helium-split-clienthello";
+--- a/chrome/browser/helium_flag_entries.h
++++ b/chrome/browser/helium_flag_entries.h
+@@ -48,6 +48,11 @@
+      "Randomizes the number of cores returned by "
+      "`navigator.hardwareConcurrency` in a reasonable range. Helium flag.",
+      kOsAll, FEATURE_VALUE_TYPE(blink::features::kHeliumNoiseCpuCores)},
++    {helium::kHeliumContainersCommandLine, "Containers",
++     "Adds Containers, so you can stay signed in to different accounts "
++     "on the same site in separate tabs, without making another profile. "
++     "Helium flag.",
++     kOsDesktop, FEATURE_VALUE_TYPE(containers::features::kHeliumContainers)},
+     // core/network
+     {helium::kDisableEchCommandLine, "Disable Encrypted Client Hello (ECH)",
+      "Disables TLS Encrypted Client Hello, reducing traffic privacy when "
+--- a/chrome/browser/about_flags.cc
++++ b/chrome/browser/about_flags.cc
+@@ -104,6 +104,7 @@
+ #include "components/component_updater/component_updater_switches.h"
+ #include "components/compose/buildflags.h"
+ #include "components/compose/core/browser/compose_features.h"
++#include "components/containers/core/common/features.h"
+ #include "components/content_settings/core/common/features.h"
+ #include "components/contextual_tasks/public/features.h"
+ #include "components/critical_actions/core/browser/features.h"
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1136,6 +1136,7 @@ source_set("core") {
+     "//components/commerce/core:feature_list",
+     "//components/commerce/core/internals/mojom:mojo_bindings",
+     "//components/compose/core/browser:features",
++    "//components/containers/core/common",
+     "//components/content_capture/browser",
+     "//components/content_settings/browser",
+     "//components/content_settings/browser/ui",
+--- a/chrome/browser/DEPS
++++ b/chrome/browser/DEPS
+@@ -109,6 +109,7 @@ include_rules = [
+   "+components/compose",
+   "+components/consent_auditor",
+   "+components/constrained_window",
++  "+components/containers/core",
+   "+components/content_capture/browser",
+   "+components/content_capture/common",
+   "+components/content_extraction/content/browser",
+--- /dev/null
++++ b/components/containers/core/common/BUILD.gn
+@@ -0,0 +1,14 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++static_library("common") {
++  sources = [
++    "container_id.cc",
++    "container_id.h",
++    "features.cc",
++    "features.h",
++  ]
++
++  deps = [ "//base" ]
++}
+--- /dev/null
++++ b/components/containers/core/common/container_id.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/core/common/container_id.h"
++
++#include <algorithm>
++
++#include "base/strings/string_util.h"
++#include "base/uuid.h"
++
++namespace containers {
++
++bool IsValidContainerId(std::string_view id) {
++  if (id.empty() || id.size() > kMaxContainerIdLength) {
++    return false;
++  }
++
++  return std::ranges::all_of(id, [](char c) {
++    return base::IsAsciiAlphaNumeric(c) || c == '-';
++  });
++}
++
++std::string GenerateContainerId() {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/common/container_id.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_COMMON_CONTAINER_ID_H_
++#define COMPONENTS_CONTAINERS_CORE_COMMON_CONTAINER_ID_H_
++
++#include <string>
++#include <string_view>
++
++namespace containers {
++
++// StoragePartition domain that holds the site data of all containers. The
++// container id is used as the partition name.
++inline constexpr char kContainersStoragePartitionDomain[] = "containers";
++
++// Container ids are also StoragePartition names, so they are limited to
++// characters that are safe in a partition key.
++inline constexpr size_t kMaxContainerIdLength = 64;
++
++// Returns true if `id` is non-empty, at most kMaxContainerIdLength long and
++// only consists of [A-Za-z0-9-].
++bool IsValidContainerId(std::string_view id);
++
++// Returns a new random container id.
++std::string GenerateContainerId();
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_COMMON_CONTAINER_ID_H_
+--- /dev/null
++++ b/components/containers/core/common/features.cc
+@@ -0,0 +1,13 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/core/common/features.h"
++
++namespace containers::features {
++
++// Enables container tabs: separate cookie and site storage jars for tabs
++// within a single profile.
++BASE_FEATURE(kHeliumContainers, base::FEATURE_DISABLED_BY_DEFAULT);
++
++}  // namespace containers::features
+--- /dev/null
++++ b/components/containers/core/common/features.h
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
++#define COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
++
++#include "base/feature_list.h"
++
++namespace containers::features {
++
++BASE_DECLARE_FEATURE(kHeliumContainers);
++
++}  // namespace containers::features
++
++#endif  // COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
