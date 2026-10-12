@@ -613,7 +613,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/containers/containers_service_factory.cc
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,83 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -690,10 +690,16 @@
 +                                             GetStarterContainers());
 +}
 +
++bool ContainersServiceFactory::ServiceIsCreatedWithBrowserContext() const {
++  // Creating the service adds the starter containers, so they exist as soon as
++  // the feature is enabled.
++  return true;
++}
++
 +}  // namespace containers
 --- /dev/null
 +++ b/chrome/browser/containers/containers_service_factory.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +// Copyright 2026 The Helium Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -733,6 +739,7 @@
 +
 +  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
 +      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
 +};
 +
 +}  // namespace containers
