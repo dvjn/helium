@@ -1,0 +1,531 @@
+--- a/components/BUILD.gn
++++ b/components/BUILD.gn
+@@ -1509,3 +1509,16 @@ if (is_android) {
+     shared_libraries = [ "//components/robolectric:libcomponents_junit_tests($robolectric_toolchain)" ]
+   }
+ }
++
++# Helium: components_unittests depends on sources that Helium prunes, so the
++# containers tests get a binary of their own that builds in Helium's tree.
++if (!is_android && !is_ios) {
++  test("containers_unittests") {
++    deps = [
++      "//components/containers/content/browser:unit_tests",
++      "//components/containers/core/browser:unit_tests",
++      "//components/containers/core/common:unit_tests",
++      "//components/test:run_all_unittests",
++    ]
++  }
++}
+--- a/components/containers/DEPS
++++ b/components/containers/DEPS
+@@ -2,5 +2,6 @@ include_rules = [
+   "+components/keyed_service/core",
+   "+components/pref_registry",
+   "+components/prefs",
++  "+components/sync_preferences/testing_pref_service_syncable.h",
+   "+mojo/public/cpp/bindings",
+ ]
+--- a/components/containers/content/DEPS
++++ b/components/containers/content/DEPS
+@@ -1,3 +1,4 @@
+ include_rules = [
+   "+content/public/browser",
++  "+content/public/test",
+ ]
+--- a/components/containers/content/browser/BUILD.gn
++++ b/components/containers/content/browser/BUILD.gn
+@@ -14,3 +14,18 @@ static_library("browser") {
+     "//content/public/browser",
+   ]
+ }
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "storage_partition_utils_unittest.cc" ]
++
++  deps = [
++    ":browser",
++    "//base",
++    "//components/containers/core/common",
++    "//content/public/browser",
++    "//content/test:test_support",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/components/containers/content/browser/storage_partition_utils_unittest.cc
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/content/browser/storage_partition_utils.h"
++
++#include <memory>
++
++#include "components/containers/core/common/container_id.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/test_renderer_host.h"
++#include "content/public/test/web_contents_tester.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace containers {
++
++using ContainersStoragePartitionUtilsTest = content::RenderViewHostTestHarness;
++
++TEST_F(ContainersStoragePartitionUtilsTest, ConfigRoundTrip) {
++  content::StoragePartitionConfig config =
++      GetStoragePartitionConfigForContainer(browser_context(), "work");
++  EXPECT_EQ(kContainersStoragePartitionDomain, config.partition_domain());
++  EXPECT_EQ("work", config.partition_name());
++  EXPECT_FALSE(config.in_memory());
++  EXPECT_EQ("work", GetContainerIdFromStoragePartitionConfig(config));
++}
++
++TEST_F(ContainersStoragePartitionUtilsTest, OtherPartitionsAreNotContainers) {
++  EXPECT_FALSE(GetContainerIdFromStoragePartitionConfig(
++      content::StoragePartitionConfig::CreateDefault(browser_context())));
++  EXPECT_FALSE(GetContainerIdFromStoragePartitionConfig(
++      content::StoragePartitionConfig::Create(browser_context(), "webview",
++                                              "work", /*in_memory=*/false)));
++}
++
++TEST_F(ContainersStoragePartitionUtilsTest, DefaultWebContents) {
++  EXPECT_FALSE(GetContainerIdForWebContents(web_contents()));
++}
++
++TEST_F(ContainersStoragePartitionUtilsTest, WebContentsInContainer) {
++  std::unique_ptr<content::WebContents> contents =
++      content::WebContentsTester::CreateTestWebContents(
++          browser_context(),
++          content::SiteInstance::CreateForFixedStoragePartition(
++              browser_context(), GURL("https://example.com"),
++              GetStoragePartitionConfigForContainer(browser_context(),
++                                                    "work")));
++  EXPECT_EQ("work", GetContainerIdForWebContents(contents.get()));
++}
++
++TEST_F(ContainersStoragePartitionUtilsTest, FallsBackToStoredId) {
++  SetContainerIdForWebContents(web_contents(), "personal");
++  EXPECT_EQ("personal", GetContainerIdForWebContents(web_contents()));
++}
++
++TEST_F(ContainersStoragePartitionUtilsTest, PartitionTakesPrecedence) {
++  std::unique_ptr<content::WebContents> contents =
++      content::WebContentsTester::CreateTestWebContents(
++          browser_context(),
++          content::SiteInstance::CreateForFixedStoragePartition(
++              browser_context(), GURL("https://example.com"),
++              GetStoragePartitionConfigForContainer(browser_context(),
++                                                    "work")));
++  SetContainerIdForWebContents(contents.get(), "stale");
++  EXPECT_EQ("work", GetContainerIdForWebContents(contents.get()));
++}
++
++}  // namespace containers
+--- a/components/containers/core/browser/BUILD.gn
++++ b/components/containers/core/browser/BUILD.gn
+@@ -23,3 +23,20 @@ static_library("browser") {
+     "//components/pref_registry",
+   ]
+ }
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [
++    "containers_service_unittest.cc",
++    "prefs_unittest.cc",
++  ]
++
++  deps = [
++    ":browser",
++    "//base",
++    "//base/test:test_support",
++    "//components/containers/core/common",
++    "//components/sync_preferences:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/components/containers/core/browser/containers_service_unittest.cc
+@@ -0,0 +1,247 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/core/browser/containers_service.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/containers/core/browser/prefs.h"
++#include "components/containers/core/common/container_id.h"
++#include "components/sync_preferences/testing_pref_service_syncable.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace containers {
++
++namespace {
++
++mojom::ContainerPtr MakeContainer(std::string name,
++                                  std::string id = std::string()) {
++  return mojom::Container::New(std::move(id), std::move(name),
++                               mojom::Color::kBlue);
++}
++
++std::vector<std::string> GetNames(
++    const std::vector<mojom::ContainerPtr>& containers) {
++  std::vector<std::string> names;
++  for (const mojom::ContainerPtr& container : containers) {
++    names.push_back(container->name);
++  }
++  return names;
++}
++
++class TestObserver : public ContainersService::Observer {
++ public:
++  void OnContainersChanged() override { ++change_count_; }
++
++  int change_count() const { return change_count_; }
++
++ private:
++  int change_count_ = 0;
++};
++
++}  // namespace
++
++class ContainersServiceTest : public testing::Test {
++ protected:
++  void SetUp() override { RegisterProfilePrefs(prefs_.registry()); }
++
++  void TearDown() override {
++    if (service_) {
++      service_->Shutdown();
++    }
++  }
++
++  ContainersService* CreateService(
++      std::vector<mojom::ContainerPtr> starter_containers = {}) {
++    if (service_) {
++      service_->Shutdown();
++    }
++    service_ = std::make_unique<ContainersService>(
++        &prefs_, std::move(starter_containers));
++    return service_.get();
++  }
++
++  // Adds containers with the given names and returns their ids.
++  std::vector<std::string> AddContainers(
++      const std::vector<std::string>& names) {
++    std::vector<std::string> ids;
++    for (const std::string& name : names) {
++      auto id = service_->AddContainer(MakeContainer(name));
++      EXPECT_TRUE(id.has_value());
++      ids.push_back(id.value());
++    }
++    return ids;
++  }
++
++  sync_preferences::TestingPrefServiceSyncable prefs_;
++  std::unique_ptr<ContainersService> service_;
++};
++
++TEST_F(ContainersServiceTest, AddsStarterContainersOnce) {
++  std::vector<mojom::ContainerPtr> starters;
++  starters.push_back(MakeContainer("Personal"));
++  starters.push_back(MakeContainer("Work"));
++  CreateService(std::move(starters));
++
++  std::vector<mojom::ContainerPtr> containers = service_->GetContainers();
++  EXPECT_EQ((std::vector<std::string>{"Personal", "Work"}),
++            GetNames(containers));
++  for (const mojom::ContainerPtr& container : containers) {
++    EXPECT_TRUE(IsValidContainerId(container->id));
++  }
++
++  // Removing all containers must not bring the starters back.
++  for (const mojom::ContainerPtr& container : containers) {
++    EXPECT_FALSE(service_->RemoveContainer(container->id));
++  }
++  std::vector<mojom::ContainerPtr> starters_again;
++  starters_again.push_back(MakeContainer("Personal"));
++  CreateService(std::move(starters_again));
++  EXPECT_TRUE(service_->GetContainers().empty());
++}
++
++TEST_F(ContainersServiceTest, StarterContainersDontReplaceExistingOnes) {
++  std::vector<mojom::ContainerPtr> existing;
++  existing.push_back(MakeContainer("Existing", "existing-id"));
++  SetContainersToPrefs(existing, prefs_);
++
++  std::vector<mojom::ContainerPtr> starters;
++  starters.push_back(MakeContainer("Personal"));
++  CreateService(std::move(starters));
++
++  EXPECT_EQ((std::vector<std::string>{"Existing"}),
++            GetNames(service_->GetContainers()));
++}
++
++TEST_F(ContainersServiceTest, AddContainer) {
++  CreateService();
++
++  auto id = service_->AddContainer(MakeContainer("  Work  "));
++  ASSERT_TRUE(id.has_value());
++  EXPECT_TRUE(IsValidContainerId(id.value()));
++
++  mojom::ContainerPtr container = service_->GetContainer(id.value());
++  ASSERT_TRUE(container);
++  EXPECT_EQ("Work", container->name);
++
++  EXPECT_EQ(mojom::ContainerOperationError::kIdShouldBeEmpty,
++            service_->AddContainer(MakeContainer("Work", "some-id")).error());
++  EXPECT_EQ(mojom::ContainerOperationError::kInvalidName,
++            service_->AddContainer(MakeContainer(" \t ")).error());
++  EXPECT_EQ(1u, service_->GetContainers().size());
++}
++
++TEST_F(ContainersServiceTest, UpdateContainer) {
++  CreateService();
++  std::string id = AddContainers({"Work"})[0];
++
++  mojom::ContainerPtr update =
++      mojom::Container::New(id, "Office", mojom::Color::kOrange);
++  EXPECT_FALSE(service_->UpdateContainer(update.Clone()));
++  EXPECT_EQ(update, service_->GetContainer(id));
++
++  EXPECT_EQ(mojom::ContainerOperationError::kIdShouldBeSet,
++            service_->UpdateContainer(MakeContainer("Office")));
++  EXPECT_EQ(mojom::ContainerOperationError::kNotFound,
++            service_->UpdateContainer(MakeContainer("Office", "missing")));
++  EXPECT_EQ(mojom::ContainerOperationError::kInvalidName,
++            service_->UpdateContainer(MakeContainer("", id)));
++}
++
++TEST_F(ContainersServiceTest, RemoveContainer) {
++  CreateService();
++  std::vector<std::string> ids = AddContainers({"Work", "Personal"});
++
++  EXPECT_FALSE(service_->RemoveContainer(ids[0]));
++  EXPECT_FALSE(service_->GetContainer(ids[0]));
++  EXPECT_EQ((std::vector<std::string>{"Personal"}),
++            GetNames(service_->GetContainers()));
++
++  EXPECT_EQ(mojom::ContainerOperationError::kNotFound,
++            service_->RemoveContainer(ids[0]));
++  EXPECT_EQ(mojom::ContainerOperationError::kIdShouldBeSet,
++            service_->RemoveContainer(""));
++}
++
++TEST_F(ContainersServiceTest, MoveContainer) {
++  CreateService();
++  std::vector<std::string> ids = AddContainers({"A", "B", "C"});
++
++  EXPECT_FALSE(service_->MoveContainer(ids[0], 2));
++  EXPECT_EQ((std::vector<std::string>{"B", "C", "A"}),
++            GetNames(service_->GetContainers()));
++
++  EXPECT_FALSE(service_->MoveContainer(ids[2], 0));
++  EXPECT_EQ((std::vector<std::string>{"C", "B", "A"}),
++            GetNames(service_->GetContainers()));
++
++  EXPECT_EQ(mojom::ContainerOperationError::kInvalidIndex,
++            service_->MoveContainer(ids[0], 3));
++  EXPECT_EQ(mojom::ContainerOperationError::kNotFound,
++            service_->MoveContainer("missing", 0));
++}
++
++TEST_F(ContainersServiceTest, UsedContainersOutliveRemoval) {
++  CreateService();
++  std::string id = AddContainers({"Work"})[0];
++  EXPECT_TRUE(service_->GetUsedContainers().empty());
++
++  service_->MarkContainerUsed(*service_->GetContainer(id));
++  ASSERT_EQ(1u, service_->GetUsedContainers().size());
++
++  // Edits to a used container refresh its last-known details.
++  EXPECT_FALSE(service_->UpdateContainer(MakeContainer("Office", id)));
++  EXPECT_EQ("Office", service_->GetUsedContainers()[0]->name);
++
++  EXPECT_FALSE(service_->RemoveContainer(id));
++  std::vector<mojom::ContainerPtr> used = service_->GetUsedContainers();
++  ASSERT_EQ(1u, used.size());
++  EXPECT_EQ(id, used[0]->id);
++  EXPECT_EQ("Office", used[0]->name);
++
++  service_->ForgetUsedContainer(id);
++  EXPECT_TRUE(service_->GetUsedContainers().empty());
++}
++
++TEST_F(ContainersServiceTest, UnusedContainerEditsDontAddUsedRecord) {
++  CreateService();
++  std::string id = AddContainers({"Work"})[0];
++
++  EXPECT_FALSE(service_->UpdateContainer(MakeContainer("Office", id)));
++  EXPECT_TRUE(service_->GetUsedContainers().empty());
++}
++
++TEST_F(ContainersServiceTest, NotifiesObservers) {
++  CreateService();
++  TestObserver observer;
++  base::ScopedObservation<ContainersService, ContainersService::Observer>
++      observation(&observer);
++  observation.Observe(service_.get());
++
++  std::string id = AddContainers({"Work"})[0];
++  EXPECT_EQ(1, observer.change_count());
++
++  EXPECT_FALSE(service_->UpdateContainer(MakeContainer("Office", id)));
++  EXPECT_EQ(2, observer.change_count());
++
++  // Failed operations don't notify.
++  EXPECT_TRUE(service_->RemoveContainer("missing"));
++  EXPECT_EQ(2, observer.change_count());
++
++  // Neither does recording usage.
++  service_->MarkContainerUsed(*service_->GetContainer(id));
++  EXPECT_EQ(2, observer.change_count());
++
++  // Changes made directly to prefs (for example by sync) do.
++  prefs_.SetList(prefs::kContainersList, base::ListValue());
++  EXPECT_EQ(3, observer.change_count());
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/prefs_unittest.cc
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/core/browser/prefs.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/values.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/sync_preferences/testing_pref_service_syncable.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace containers {
++
++class ContainersPrefsTest : public testing::Test {
++ protected:
++  void SetUp() override { RegisterProfilePrefs(prefs_.registry()); }
++
++  sync_preferences::TestingPrefServiceSyncable prefs_;
++};
++
++TEST_F(ContainersPrefsTest, EmptyByDefault) {
++  EXPECT_TRUE(GetContainersFromPrefs(prefs_).empty());
++}
++
++TEST_F(ContainersPrefsTest, RoundTrip) {
++  std::vector<mojom::ContainerPtr> containers;
++  containers.push_back(
++      mojom::Container::New("container-1", "Work", mojom::Color::kRed));
++  containers.push_back(
++      mojom::Container::New("container-2", "Personal", mojom::Color::kBlue));
++
++  SetContainersToPrefs(containers, prefs_);
++
++  std::vector<mojom::ContainerPtr> result = GetContainersFromPrefs(prefs_);
++  ASSERT_EQ(2u, result.size());
++  EXPECT_EQ(containers[0], result[0]);
++  EXPECT_EQ(containers[1], result[1]);
++}
++
++TEST_F(ContainersPrefsTest, SkipsInvalidAndDuplicateEntries) {
++  base::ListValue list;
++  list.Append(42);
++  list.Append(base::DictValue().Set("id", "missing-name"));
++  list.Append(base::DictValue().Set("name", "Missing id"));
++  list.Append(base::DictValue().Set("id", "bad id").Set("name", "Bad id"));
++  list.Append(base::DictValue().Set("id", "ok").Set("name", ""));
++  list.Append(base::DictValue().Set("id", "ok").Set("name", "First"));
++  list.Append(base::DictValue().Set("id", "ok").Set("name", "Duplicate"));
++  prefs_.SetList(prefs::kContainersList, std::move(list));
++
++  std::vector<mojom::ContainerPtr> result = GetContainersFromPrefs(prefs_);
++  ASSERT_EQ(1u, result.size());
++  EXPECT_EQ("ok", result[0]->id);
++  EXPECT_EQ("First", result[0]->name);
++}
++
++TEST_F(ContainersPrefsTest, UnknownColorFallsBackToDefault) {
++  mojom::ContainerPtr container = ContainerFromValue(base::DictValue()
++                                                         .Set("id", "id")
++                                                         .Set("name", "Name")
++                                                         .Set("color", -1));
++  ASSERT_TRUE(container);
++  EXPECT_EQ(mojom::Color::kGrey, container->color);
++}
++
++}  // namespace containers
+--- a/components/containers/core/common/BUILD.gn
++++ b/components/containers/core/common/BUILD.gn
+@@ -12,3 +12,14 @@ static_library("common") {
+ 
+   deps = [ "//base" ]
+ }
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "container_id_unittest.cc" ]
++
++  deps = [
++    ":common",
++    "//base",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/components/containers/core/common/container_id_unittest.cc
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/containers/core/common/container_id.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace containers {
++
++TEST(ContainerIdTest, GeneratedIdsAreValidAndUnique) {
++  const std::string first = GenerateContainerId();
++  const std::string second = GenerateContainerId();
++
++  EXPECT_TRUE(IsValidContainerId(first));
++  EXPECT_TRUE(IsValidContainerId(second));
++  EXPECT_NE(first, second);
++}
++
++TEST(ContainerIdTest, IsValidContainerId) {
++  EXPECT_TRUE(IsValidContainerId("work"));
++  EXPECT_TRUE(IsValidContainerId("t-0123-abcd"));
++  EXPECT_TRUE(IsValidContainerId("ABC-123"));
++
++  EXPECT_FALSE(IsValidContainerId(""));
++  EXPECT_FALSE(IsValidContainerId("has space"));
++  EXPECT_FALSE(IsValidContainerId("under_score"));
++  EXPECT_FALSE(IsValidContainerId("../escape"));
++  EXPECT_FALSE(IsValidContainerId("caf\xC3\xA9"));
++  EXPECT_FALSE(IsValidContainerId(std::string(kMaxContainerIdLength + 1, 'a')));
++  EXPECT_TRUE(IsValidContainerId(std::string(kMaxContainerIdLength, 'a')));
++}
++
++}  // namespace containers

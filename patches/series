@@ -381,3 +381,4 @@ helium/containers/add-container-tab-indicator.patch
 helium/containers/open-links-in-container.patch
 helium/containers/open-tabs-in-container-menu.patch
 helium/containers/add-containers-settings-page.patch
+helium/containers/add-containers-unit-tests.patch
