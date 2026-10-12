@@ -1,0 +1,271 @@
+--- a/chrome/browser/containers/container_color.cc
++++ b/chrome/browser/containers/container_color.cc
+@@ -4,7 +4,14 @@
+ 
+ #include "chrome/browser/containers/container_color.h"
+ 
++#include <string>
++
+ #include "base/notreached.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "content/public/browser/web_contents.h"
+ 
+ namespace containers {
+ 
+@@ -32,4 +39,29 @@ tab_groups::TabGroupColorId GetTabGroupC
+   NOTREACHED();
+ }
+ 
++std::optional<mojom::Color> GetContainerColorForWebContents(
++    content::WebContents* web_contents) {
++  std::optional<std::string> container_id =
++      GetContainerIdForWebContents(web_contents);
++  if (!container_id) {
++    return std::nullopt;
++  }
++
++  ContainersService* service = ContainersServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(web_contents->GetBrowserContext()));
++  if (!service) {
++    return std::nullopt;
++  }
++
++  if (mojom::ContainerPtr container = service->GetContainer(*container_id)) {
++    return container->color;
++  }
++  for (const mojom::ContainerPtr& container : service->GetUsedContainers()) {
++    if (container->id == *container_id) {
++      return container->color;
++    }
++  }
++  return mojom::Color::kGrey;
++}
++
+ }  // namespace containers
+--- a/chrome/browser/containers/container_color.h
++++ b/chrome/browser/containers/container_color.h
+@@ -5,15 +5,26 @@
+ #ifndef CHROME_BROWSER_CONTAINERS_CONTAINER_COLOR_H_
+ #define CHROME_BROWSER_CONTAINERS_CONTAINER_COLOR_H_
+ 
++#include <optional>
++
+ #include "components/containers/core/mojom/containers.mojom.h"
+ #include "components/tab_groups/tab_group_color.h"
+ 
++namespace content {
++class WebContents;
++}
++
+ namespace containers {
+ 
+ // Returns the tab group colour a container colour is drawn with, so container
+ // indicators follow light, dark and custom themes like tab groups do.
+ tab_groups::TabGroupColorId GetTabGroupColorId(mojom::Color color);
+ 
++// Returns the colour of the container `web_contents` belongs to, or nullopt if
++// it doesn't belong to one. A removed container keeps the colour it last had.
++std::optional<mojom::Color> GetContainerColorForWebContents(
++    content::WebContents* web_contents);
++
+ }  // namespace containers
+ 
+ #endif  // CHROME_BROWSER_CONTAINERS_CONTAINER_COLOR_H_
+--- a/chrome/browser/ui/views/tabs/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/BUILD.gn
+@@ -129,6 +129,29 @@ source_set("tab_group_impl") {
+   public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ }
+ 
++source_set("container_indicator") {
++  sources = [
++    "container_indicator.cc",
++    "container_indicator.h",
++  ]
++
++  deps = [
++    ":tab_style_views",
++    "//base:i18n",
++    "//chrome/browser/containers",
++    "//chrome/browser/ui/tabs",
++    "//chrome/browser/ui/tabs:tab_group",
++    "//chrome/browser/ui/views/tabs/shared",
++    "//components/tabs:public",
++    "//skia",
++    "//ui/color",
++    "//ui/gfx",
++    "//ui/gfx/geometry",
++    "//ui/gfx/geometry:geometry_skia",
++    "//ui/views",
++  ]
++}
++
+ source_set("tab_style_views") {
+   sources = [ "tab_style_views.h" ]
+ 
+@@ -266,6 +289,7 @@ source_set("tab_impl") {
+ 
+   deps = [
+     ":base",
++    ":container_indicator",
+     ":tab",
+     ":tab_strip",
+     ":tab_style_views",
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -117,6 +117,7 @@ source_set("impl") {
+     "//chrome/browser/ui/views/frame:glass_frame_service",
+     "//chrome/browser/ui/views/frame:themed_background",
+     "//chrome/browser/ui/views/tabs:base",
++    "//chrome/browser/ui/views/tabs:container_indicator",
+     "//chrome/browser/ui/views/tabs:tab",
+     "//chrome/browser/ui/views/tabs:tab_group",
+     "//chrome/browser/ui/views/tabs:tab_style_views",
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_view_horizontal_layout.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.h"
+ #include "chrome/browser/ui/views/tabs/common/vertical_tab_style_views.h"
++#include "chrome/browser/ui/views/tabs/container_indicator.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/tab/alert_indicator_button.h"
+ #include "chrome/browser/ui/views/tabs/tab/glow_hover_controller.h"
+@@ -796,6 +797,8 @@ void TabView::OnPaint(gfx::Canvas* canva
+   }
+ 
+   tab_styling()->PaintTab(canvas);
++  PaintContainerIndicator(canvas, *this, *tab_styling(), GetTabInterface(),
++                          orientation_);
+ 
+   views::View::OnPaint(canvas);
+ }
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/container_indicator.cc
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/tabs/container_indicator.h"
++
++#include <optional>
++
++#include "base/i18n/rtl.h"
++#include "chrome/browser/containers/container_color.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
++#include "chrome/browser/ui/views/tabs/tab_style_views.h"
++#include "components/tabs/public/tab_interface.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++constexpr int kIndicatorThickness = 2;
++
++}  // namespace
++
++void PaintContainerIndicator(gfx::Canvas* canvas,
++                             const views::View& tab_view,
++                             const TabStyleViews& tab_style,
++                             const tabs::TabInterface* tab,
++                             TabStripOrientation orientation) {
++  if (!tab || !tab->GetContents()) {
++    return;
++  }
++
++  std::optional<containers::mojom::Color> color =
++      containers::GetContainerColorForWebContents(tab->GetContents());
++  if (!color) {
++    return;
++  }
++
++  const SkPath shape =
++      tab_style.GetPath(TabStyle::PathType::kHighlight, /*scale=*/1.0f,
++                        {.render_units = TabStyle::RenderUnits::kDips});
++  const gfx::Rect bounds =
++      gfx::ToEnclosingRect(gfx::SkRectToRectF(shape.getBounds()));
++  gfx::Rect line = bounds;
++  if (orientation == TabStripOrientation::kVertical) {
++    line.set_width(kIndicatorThickness);
++    if (base::i18n::IsRTL()) {
++      line.set_x(bounds.right() - kIndicatorThickness);
++    }
++  } else {
++    line.set_height(kIndicatorThickness);
++  }
++
++  gfx::ScopedCanvas scoped_canvas(canvas);
++  canvas->ClipPath(shape, /*do_anti_alias=*/true);
++  canvas->FillRect(line, tab_view.GetColorProvider()->GetColor(
++                             GetTabGroupTabStripColorId(
++                                 containers::GetTabGroupColorId(*color),
++                                 tab_view.GetWidget()->ShouldPaintAsActive())));
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/tabs/container_indicator.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_INDICATOR_H_
++#define CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_INDICATOR_H_
++
++class TabStyleViews;
++enum class TabStripOrientation;
++
++namespace gfx {
++class Canvas;
++}
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace views {
++class View;
++}
++
++// Paints a line in the colour of the container `tab` belongs to, if any, on
++// `tab_view`: along the top of a horizontal tab and along the leading edge of
++// a vertical tab, clipped to the tab's shape. Tab group colours are drawn
++// below or beside tabs, so the two don't overlap.
++void PaintContainerIndicator(gfx::Canvas* canvas,
++                             const views::View& tab_view,
++                             const TabStyleViews& tab_style,
++                             const tabs::TabInterface* tab,
++                             TabStripOrientation orientation);
++
++#endif  // CHROME_BROWSER_UI_VIEWS_TABS_CONTAINER_INDICATOR_H_
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/browser_tab_strip_controller.h"
++#include "chrome/browser/ui/views/tabs/container_indicator.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "chrome/browser/ui/views/tabs/tab/alert_indicator_button.h"
+@@ -903,6 +904,8 @@ void Tab::PaintChildren(const views::Pai
+ 
+ void Tab::OnPaint(gfx::Canvas* canvas) {
+   tab_style_views()->PaintTab(canvas);
++  PaintContainerIndicator(canvas, *this, *tab_style_views(), tab_handle_.Get(),
++                          TabStripOrientation::kHorizontal);
+ }
+ 
+ void Tab::AddedToWidget() {

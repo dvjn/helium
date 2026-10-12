@@ -377,3 +377,4 @@ helium/containers/add-containers-web-contents-utils.patch
 helium/containers/open-tabs-in-containers.patch
 helium/containers/keep-links-in-container.patch
 helium/containers/share-permissions-with-profile.patch
+helium/containers/add-container-tab-indicator.patch
