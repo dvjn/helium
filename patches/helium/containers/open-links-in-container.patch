@@ -1,0 +1,369 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -1923,6 +1923,18 @@ are declared in tools/grit/grit_args.gni
+       <message name="IDS_CONTAINERS_STARTER_SHOPPING" desc="Name of a container that is created by default, meant for online shopping.">
+         Shopping
+       </message>
++      <message name="IDS_CONTENT_CONTEXT_OPENLINKINCONTAINER" desc="The name of the context menu item that opens a link in a new tab in a chosen container.">
++        Open link in Container
++      </message>
++      <message name="IDS_TAB_CXMENU_OPENINCONTAINER" desc="The label of the tab context menu item that opens the tab's page in a new tab in a chosen container.">
++        Open in Container
++      </message>
++      <message name="IDS_CONTAINERS_MENU_NO_CONTAINER" desc="Item of the container submenu that opens the page in a regular tab, outside any container.">
++        No Container
++      </message>
++      <message name="IDS_CONTAINERS_MENU_MANAGE" desc="Item of the container submenu that opens the containers settings page.">
++        Manage Containers
++      </message>
+       <message name="IDS_IMPORT_SETTINGS_MENU_LABEL" desc="The app menu label to import bookmarks and settings.">
+         Import bookmarks and settings...
+       </message>
+--- a/chrome/browser/renderer_context_menu/BUILD.gn
++++ b/chrome/browser/renderer_context_menu/BUILD.gn
+@@ -153,6 +153,7 @@ source_set("impl") {
+       "//chrome/browser/ui:ui_features",
+       "//chrome/browser/ui/autofill",
+       "//chrome/browser/ui/browser_window",
++      "//chrome/browser/ui/containers",
+       "//chrome/browser/ui/lens",
+       "//chrome/browser/ui/profiles",
+       "//chrome/browser/ui/qrcode_generator",
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -111,6 +111,8 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/containers/containers_menu_model.h"
++#include "chrome/browser/ui/containers/open_in_container.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+@@ -2007,6 +2009,26 @@ void RenderViewContextMenu::AppendLinkIt
+         menu_model_.SetElementIdentifierAt(command_index,
+                                            kOpenLinkInSplitMenuItem);
+       }
++
++      if (IsNormalBrowser()) {
++        containers_submenu_model_ = containers::ContainersMenuModel::Create(
++            source_web_contents_,
++            base::BindRepeating(
++                [](RenderViewContextMenu* menu,
++                   const std::optional<std::string>& container_id) {
++                  containers::OpenURLInContainer(
++                      menu->GetBrowser(), menu->params_.link_url,
++                      menu->params_.frame_origin, container_id,
++                      WindowOpenDisposition::NEW_BACKGROUND_TAB);
++                },
++                base::Unretained(this)));
++        if (containers_submenu_model_) {
++          menu_model_.AddSubMenuWithStringId(
++              containers::kOpenInContainerCommandId,
++              IDS_CONTENT_CONTEXT_OPENLINKINCONTAINER,
++              containers_submenu_model_.get());
++        }
++      }
+     }
+ #endif
+ 
+@@ -3360,6 +3382,10 @@ bool RenderViewContextMenu::IsCommandIdE
+     return params_.link_url.is_valid();
+   }
+ 
++  if (id == containers::kOpenInContainerCommandId) {
++    return params_.link_url.is_valid();
++  }
++
+   // On ChromeOS a dedicated OTR profile is used for captive portal signin to
+   // protect user privacy. Since some policies prevent Incognito browsing,
+   // disable options that trigger navigation in the context menu.
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.h
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+@@ -631,6 +631,9 @@ class RenderViewContextMenu
+ 
+   std::unique_ptr<ui::SimpleMenuModel> split_layout_submenu_;
+ 
++  // "Open link in container" submenu.
++  std::unique_ptr<ui::SimpleMenuModel> containers_submenu_model_;
++
+   //  Used for CTR metrics of menu item for opening Glic.
+   bool glic_item_shown_ = false;
+   bool glic_item_executed_ = false;
+--- /dev/null
++++ b/chrome/browser/ui/containers/BUILD.gn
+@@ -0,0 +1,32 @@
++# Copyright 2026 The Helium Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++source_set("containers") {
++  sources = [
++    "containers_menu_model.cc",
++    "containers_menu_model.h",
++    "open_in_container.cc",
++    "open_in_container.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//ui/base",
++    "//ui/menus",
++    "//url",
++  ]
++
++  deps = [
++    "//chrome/app:generated_resources",
++    "//chrome/app/vector_icons",
++    "//chrome/browser/containers",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/tabs:tab_group",
++    "//components/containers/content/browser",
++    "//components/containers/core/browser",
++    "//content/public/browser",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/containers/containers_menu_model.cc
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/containers/containers_menu_model.h"
++
++#include <utility>
++
++#include "base/check_op.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/containers/container_color.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/models/image_model.h"
++
++namespace containers {
++
++namespace {
++
++// Items are numbered from here, in a range no other command uses, so the
++// submenu can be added to any menu.
++constexpr int kFirstCommandId = kOpenInContainerCommandId + 1;
++constexpr size_t kMaxItems = 99;
++
++constexpr int kIconSize = 14;
++
++}  // namespace
++
++// static
++std::unique_ptr<ContainersMenuModel> ContainersMenuModel::Create(
++    content::WebContents* source,
++    Callback callback) {
++  ContainersService* service = ContainersServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(source->GetBrowserContext()));
++  if (!service) {
++    return nullptr;
++  }
++
++  const std::optional<std::string> current_container_id =
++      GetContainerIdForWebContents(source);
++  auto model = base::WrapUnique(new ContainersMenuModel(std::move(callback)));
++  for (const mojom::ContainerPtr& container : service->GetContainers()) {
++    if (container->id == current_container_id) {
++      continue;
++    }
++    model->AddContainerItem(
++        container->id, base::UTF8ToUTF16(container->name),
++        ui::ImageModel::FromVectorIcon(
++            kCircleFilledIcon,
++            GetTabGroupContextMenuColorId(GetTabGroupColorId(container->color)),
++            kIconSize));
++  }
++  if (current_container_id) {
++    if (model->GetItemCount() > 0) {
++      model->AddSeparator(ui::NORMAL_SEPARATOR);
++    }
++    model->AddContainerItem(
++        std::nullopt,
++        l10n_util::GetStringUTF16(IDS_CONTAINERS_MENU_NO_CONTAINER),
++        ui::ImageModel());
++  }
++
++  if (model->container_ids_.empty()) {
++    return nullptr;
++  }
++  return model;
++}
++
++ContainersMenuModel::ContainersMenuModel(Callback callback)
++    : ui::SimpleMenuModel(this), callback_(std::move(callback)) {}
++
++ContainersMenuModel::~ContainersMenuModel() = default;
++
++void ContainersMenuModel::ExecuteCommand(int command_id, int event_flags) {
++  const size_t index = command_id - kFirstCommandId;
++  CHECK_LT(index, container_ids_.size());
++  callback_.Run(container_ids_[index]);
++}
++
++void ContainersMenuModel::AddContainerItem(
++    std::optional<std::string> container_id,
++    const std::u16string& label,
++    const ui::ImageModel& icon) {
++  if (container_ids_.size() >= kMaxItems) {
++    return;
++  }
++
++  const int command_id = kFirstCommandId + container_ids_.size();
++  container_ids_.push_back(std::move(container_id));
++  if (icon.IsEmpty()) {
++    AddItem(command_id, label);
++  } else {
++    AddItemWithIcon(command_id, label, icon);
++  }
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/chrome/browser/ui/containers/containers_menu_model.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_MENU_MODEL_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "ui/menus/simple_menu_model.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace containers {
++
++// Command id of the item that holds a ContainersMenuModel in the page and tab
++// context menus. The items of the submenu are handled by the submenu itself.
++inline constexpr int kOpenInContainerCommandId = 52700;
++
++// Submenu of "Open in container" items, listing the containers of a profile.
++// It is its own delegate: choosing an item runs a callback with the id of the
++// chosen container, or with nullopt for "No container".
++class ContainersMenuModel : public ui::SimpleMenuModel,
++                            public ui::SimpleMenuModel::Delegate {
++ public:
++  using Callback = base::RepeatingCallback<void(
++      const std::optional<std::string>& container_id)>;
++
++  // Returns a submenu for opening a page from `source` in another container:
++  // the container of `source` is left out, and "No container" is added if
++  // `source` is in a container. Returns nullptr if containers are unavailable
++  // or there is nothing to choose.
++  static std::unique_ptr<ContainersMenuModel> Create(
++      content::WebContents* source,
++      Callback callback);
++
++  ContainersMenuModel(const ContainersMenuModel&) = delete;
++  ContainersMenuModel& operator=(const ContainersMenuModel&) = delete;
++  ~ContainersMenuModel() override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  explicit ContainersMenuModel(Callback callback);
++
++  void AddContainerItem(std::optional<std::string> container_id,
++                        const std::u16string& label,
++                        const ui::ImageModel& icon);
++
++  // Container id of each item, indexed by command id - kFirstCommandId.
++  std::vector<std::optional<std::string>> container_ids_;
++  Callback callback_;
++};
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_UI_CONTAINERS_CONTAINERS_MENU_MODEL_H_
+--- /dev/null
++++ b/chrome/browser/ui/containers/open_in_container.cc
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/containers/open_in_container.h"
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++
++namespace containers {
++
++void OpenURLInContainer(BrowserWindowInterface* browser,
++                        const GURL& url,
++                        const std::optional<url::Origin>& initiator_origin,
++                        const std::optional<std::string>& container_id,
++                        WindowOpenDisposition disposition) {
++  NavigateParams params(browser, url, ui::PAGE_TRANSITION_LINK);
++  params.initiator_origin = initiator_origin;
++  params.disposition = disposition;
++  if (container_id) {
++    params.storage_partition_config = GetStoragePartitionConfigForContainer(
++        browser->GetProfile(), *container_id);
++  }
++  Navigate(&params);
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/chrome/browser/ui/containers/open_in_container.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_CONTAINERS_OPEN_IN_CONTAINER_H_
++#define CHROME_BROWSER_UI_CONTAINERS_OPEN_IN_CONTAINER_H_
++
++#include <optional>
++#include <string>
++
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++class BrowserWindowInterface;
++
++namespace containers {
++
++// Opens `url` in a new tab in `browser`, in the container with `container_id`,
++// or outside any container if it's nullopt. The container doesn't share site
++// data with the page `url` came from, so nothing is carried over from it
++// except `initiator_origin`, and no referrer is sent.
++void OpenURLInContainer(BrowserWindowInterface* browser,
++                        const GURL& url,
++                        const std::optional<url::Origin>& initiator_origin,
++                        const std::optional<std::string>& container_id,
++                        WindowOpenDisposition disposition);
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_UI_CONTAINERS_OPEN_IN_CONTAINER_H_
