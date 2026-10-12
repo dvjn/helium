@@ -383,3 +383,4 @@ helium/containers/open-tabs-in-container-menu.patch
 helium/containers/add-containers-settings-page.patch
 helium/containers/add-containers-unit-tests.patch
 helium/containers/add-containers-browser-tests.patch
+helium/containers/fix-dummy-page-holder-noise-tokens.patch

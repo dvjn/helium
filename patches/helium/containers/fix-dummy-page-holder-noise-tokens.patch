@@ -1,0 +1,12 @@
+--- a/third_party/blink/renderer/core/testing/dummy_page_holder.cc
++++ b/third_party/blink/renderer/core/testing/dummy_page_holder.cc
+@@ -103,7 +103,8 @@ DummyPageHolder::DummyPageHolder(
+   page_ = Page::CreateOrdinary(*chrome_client, /*opener=*/nullptr,
+                                *agent_group_scheduler_,
+                                base::UnguessableToken::Create(),
+-                               /*color_provider_colors=*/nullptr);
++                               /*color_provider_colors=*/nullptr,
++                               /*noise_tokens=*/HeliumNoiseTokenMap());
+   Settings& settings = page_->GetSettings();
+   if (setting_overrider)
+     std::move(setting_overrider).Run(settings);
