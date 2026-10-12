@@ -1,0 +1,989 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -2299,6 +2299,30 @@
+     <message name="IDS_SETTINGS_NOISE_ALLOW_OVERRIDES_TITLE" desc="Title above the list of sites where fingerprinting protection is explicitly allowed, overriding broader site exceptions.">
+       Overrides to allow fingerprinting protection
+     </message>
++    <message name="IDS_SETTINGS_CONTAINERS" desc="Title of the settings section for containers, which keep cookies and site data separate between groups of tabs.">
++      Containers
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_DESCRIPTION" desc="Explanation at the top of the containers settings section.">
++      Stay signed in to different accounts on the same site
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_EMPTY" desc="Shown in the containers settings section when there are no containers.">
++      No Containers
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_ADD_TITLE" desc="Title of the dialog for adding a container.">
++      Add Container
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_EDIT_TITLE" desc="Title of the dialog for changing the name and color of a container.">
++      Edit Container
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_NAME" desc="Label of the field for the name of a container.">
++      Name
++    </message>
++    <message name="IDS_SETTINGS_CONTAINERS_COLOR" desc="Label of the color choices for a container.">
++      Color
++    </message>
++    <message name="IDS_SETTINGS_PROFILES_AND_CONTAINERS" desc="Name of the settings page for profiles when it also has a section for containers.">
++      Profiles and Containers
++    </message>
+     <message name="IDS_SETTINGS_TITLE_AND_COUNT" desc="The title of a section in the settings page with a count of the total number of items in the section">
+       <ph name="TITLE">$1<ex>Block</ex></ph> - <ph name="COUNT">$2<ex>42</ex></ph>
+     </message>
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -96,6 +96,7 @@ build_webui("build") {
+     "glic_page/glic_page.ts",
+     "glic_page/glic_login_permissions_page.ts",
+     "glic_page/glic_subpage.ts",
++    "people_page/containers_section.ts",
+     "privacy_page/cookies_page.ts",
+     "privacy_page/do_not_track_toggle.ts",
+     "privacy_page/noise_page.ts",
+@@ -323,6 +324,7 @@ build_webui("build") {
+     "performance_page/tab_discard/exception_validation_mixin.ts",
+     "people_page/account_page.html.ts",
+     "people_page/account_page.ts",
++    "people_page/containers_browser_proxy.ts",
+     "people_page/google_services_page.html.ts",
+     "people_page/google_services_page.ts",
+     "people_page/people_page.html.ts",
+--- a/chrome/browser/resources/settings/lazy_load.ts
++++ b/chrome/browser/resources/settings/lazy_load.ts
+@@ -245,6 +245,9 @@ export {SettingsTranslatePageElement} fr
+ // </if>
+ 
+ export {SettingsAccountPageElement} from './people_page/account_page.js';
++export {ContainersBrowserProxyImpl} from './people_page/containers_browser_proxy.js';
++export type {Container, ContainerColor, ContainersBrowserProxy, ContainersInfo} from './people_page/containers_browser_proxy.js';
++export {SettingsContainersSectionElement} from './people_page/containers_section.js';
+ export {SettingsGoogleServicesPageElement} from './people_page/google_services_page.js';
+ // <if expr="not is_chromeos">
+ export {ImportDataBrowserProxyImpl, ImportDataStatus} from './people_page/import_data_browser_proxy.js';
+--- a/chrome/browser/ui/containers/BUILD.gn
++++ b/chrome/browser/ui/containers/BUILD.gn
+@@ -22,6 +22,7 @@ source_set("containers") {
+     "//chrome/app/vector_icons",
+     "//chrome/browser/containers",
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui:chrome_pages",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/tabs:tab_group",
+--- a/chrome/browser/ui/containers/containers_menu_model.cc
++++ b/chrome/browser/ui/containers/containers_menu_model.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/containers/container_color.h"
+ #include "chrome/browser/containers/containers_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/containers/content/browser/storage_partition_utils.h"
+@@ -28,7 +29,11 @@ namespace {
+ // Items are numbered from here, in a range no other command uses, so the
+ // submenu can be added to any menu.
+ constexpr int kFirstCommandId = kOpenInContainerCommandId + 1;
+-constexpr size_t kMaxItems = 99;
++constexpr size_t kMaxItems = 98;
++constexpr int kManageCommandId = kFirstCommandId + kMaxItems;
++
++// Containers have a section on the Profiles settings page.
++constexpr char kContainersSettingsPage[] = "people";
+ 
+ constexpr int kIconSize = 14;
+ 
+@@ -38,15 +43,16 @@ constexpr int kIconSize = 14;
+ std::unique_ptr<ContainersMenuModel> ContainersMenuModel::Create(
+     content::WebContents* source,
+     Callback callback) {
+-  ContainersService* service = ContainersServiceFactory::GetForProfile(
+-      Profile::FromBrowserContext(source->GetBrowserContext()));
++  Profile* profile = Profile::FromBrowserContext(source->GetBrowserContext());
++  ContainersService* service = ContainersServiceFactory::GetForProfile(profile);
+   if (!service) {
+     return nullptr;
+   }
+ 
+   const std::optional<std::string> current_container_id =
+       GetContainerIdForWebContents(source);
+-  auto model = base::WrapUnique(new ContainersMenuModel(std::move(callback)));
++  auto model = base::WrapUnique(
++      new ContainersMenuModel(profile, std::move(callback)));
+   for (const mojom::ContainerPtr& container : service->GetContainers()) {
+     if (container->id == current_container_id) {
+       continue;
+@@ -68,18 +74,26 @@ std::unique_ptr<ContainersMenuModel> Con
+         ui::ImageModel());
+   }
+ 
+-  if (model->container_ids_.empty()) {
+-    return nullptr;
++  if (model->GetItemCount() > 0) {
++    model->AddSeparator(ui::NORMAL_SEPARATOR);
+   }
++  model->AddItemWithStringId(kManageCommandId, IDS_CONTAINERS_MENU_MANAGE);
+   return model;
+ }
+ 
+-ContainersMenuModel::ContainersMenuModel(Callback callback)
+-    : ui::SimpleMenuModel(this), callback_(std::move(callback)) {}
++ContainersMenuModel::ContainersMenuModel(Profile* profile, Callback callback)
++    : ui::SimpleMenuModel(this),
++      profile_(profile),
++      callback_(std::move(callback)) {}
+ 
+ ContainersMenuModel::~ContainersMenuModel() = default;
+ 
+ void ContainersMenuModel::ExecuteCommand(int command_id, int event_flags) {
++  if (command_id == kManageCommandId) {
++    chrome::ShowSettingsSubPageForProfile(profile_, kContainersSettingsPage);
++    return;
++  }
++
+   const size_t index = command_id - kFirstCommandId;
+   CHECK_LT(index, container_ids_.size());
+   callback_.Run(container_ids_[index]);
+--- a/chrome/browser/ui/containers/containers_menu_model.h
++++ b/chrome/browser/ui/containers/containers_menu_model.h
+@@ -11,8 +11,11 @@
+ #include <vector>
+ 
+ #include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
+ #include "ui/menus/simple_menu_model.h"
+ 
++class Profile;
++
+ namespace content {
+ class WebContents;
+ }
+@@ -23,9 +26,9 @@ namespace containers {
+ // context menus. The items of the submenu are handled by the submenu itself.
+ inline constexpr int kOpenInContainerCommandId = 52700;
+ 
+-// Submenu of "Open in container" items, listing the containers of a profile.
+-// It is its own delegate: choosing an item runs a callback with the id of the
+-// chosen container, or with nullopt for "No container".
++// Submenu of "Open in container" items, listing the containers of a profile,
++// followed by "Manage containers". It is its own delegate: choosing a
++// container runs a callback with its id, or with nullopt for "No container".
+ class ContainersMenuModel : public ui::SimpleMenuModel,
+                             public ui::SimpleMenuModel::Delegate {
+  public:
+@@ -34,8 +37,7 @@ class ContainersMenuModel : public ui::S
+ 
+   // Returns a submenu for opening a page from `source` in another container:
+   // the container of `source` is left out, and "No container" is added if
+-  // `source` is in a container. Returns nullptr if containers are unavailable
+-  // or there is nothing to choose.
++  // `source` is in a container. Returns nullptr if containers are unavailable.
+   static std::unique_ptr<ContainersMenuModel> Create(
+       content::WebContents* source,
+       Callback callback);
+@@ -48,7 +50,7 @@ class ContainersMenuModel : public ui::S
+   void ExecuteCommand(int command_id, int event_flags) override;
+ 
+  private:
+-  explicit ContainersMenuModel(Callback callback);
++  ContainersMenuModel(Profile* profile, Callback callback);
+ 
+   void AddContainerItem(std::optional<std::string> container_id,
+                         const std::u16string& label,
+@@ -56,6 +58,7 @@ class ContainersMenuModel : public ui::S
+ 
+   // Container id of each item, indexed by command id - kFirstCommandId.
+   std::vector<std::optional<std::string>> container_ids_;
++  raw_ptr<Profile> profile_;
+   Callback callback_;
+ };
+ 
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -27,6 +27,7 @@ source_set("settings") {
+     "browser_lifetime_handler.h",
+     "browser_shortcuts_handler.h",
+     "captions_handler.h",
++    "containers_handler.h",
+     "custom_home_pages_table_model.h",
+     "dictation_handler.h",
+     "downloads_handler.h",
+@@ -85,6 +86,7 @@ source_set("settings") {
+     "//chrome/browser/upgrade_detector",
+     "//chrome/browser/web_applications",
+     "//chrome/common",
++    "//components/containers/core/browser",
+     "//components/content_settings/core/browser",
+     "//components/content_settings/core/common",
+     "//components/custom_handlers",
+@@ -161,6 +163,7 @@ source_set("impl") {
+     "browser_lifetime_handler.cc",
+     "browser_shortcuts_handler.cc",
+     "captions_handler.cc",
++    "containers_handler.cc",
+     "custom_home_pages_table_model.cc",
+     "dictation_handler.cc",
+     "downloads_handler.cc",
+@@ -222,6 +225,7 @@ source_set("impl") {
+     "//chrome/browser/browsing_data",
+     "//chrome/browser/browsing_data:constants",
+     "//chrome/browser/compose",
++    "//chrome/browser/containers",
+     "//chrome/browser/content_settings",
+     "//chrome/browser/content_settings:content_settings_util",
+     "//chrome/browser/contextual_tasks",
+@@ -285,6 +289,7 @@ source_set("impl") {
+     "//chrome/browser/ui/side_panel",
+     "//chrome/browser/ui/signin",
+     "//chrome/browser/ui/sync",
++    "//chrome/browser/ui/tabs:tab_group",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
+     "//chrome/browser/ui/toasts",
+@@ -337,6 +342,7 @@ source_set("impl") {
+     "//components/skills:features",
+     "//components/strings:components_strings",
+     "//components/sync/service",
++    "//components/tab_groups",
+     "//components/universal_optout",
+     "//components/user_manager:common",
+     "//components/wallet/core/browser",
+@@ -345,6 +351,8 @@ source_set("impl") {
+     "//extensions/browser",
+     "//services/device/public/cpp:device_features",
+     "//ui/base",
++    "//ui/color",
++    "//ui/gfx",
+     "//ui/webui/tracked_element",
+     "//v8:v8_version",
+   ]
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/containers_handler.cc
+@@ -0,0 +1,161 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/containers_handler.h"
++
++#include <optional>
++#include <string>
++#include <tuple>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/containers/container_color.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "components/tab_groups/tab_group_color.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/color_utils.h"
++
++namespace settings {
++
++namespace {
++
++// Colors in the order they are offered on the page, which is also the order
++// new containers take them in. Matches TabGroupModel::GetColorOrdering().
++constexpr containers::mojom::Color kColors[] = {
++    containers::mojom::Color::kBlue,   containers::mojom::Color::kPurple,
++    containers::mojom::Color::kPink,   containers::mojom::Color::kRed,
++    containers::mojom::Color::kOrange, containers::mojom::Color::kYellow,
++    containers::mojom::Color::kGreen,  containers::mojom::Color::kCyan,
++    containers::mojom::Color::kGrey,
++};
++
++std::optional<containers::mojom::Color> ColorFromValue(
++    const base::Value& value) {
++  if (!value.is_int()) {
++    return std::nullopt;
++  }
++  const auto color = static_cast<containers::mojom::Color>(value.GetInt());
++  if (!containers::mojom::IsKnownEnumValue(color)) {
++    return std::nullopt;
++  }
++  return color;
++}
++
++}  // namespace
++
++ContainersHandler::ContainersHandler(containers::ContainersService* service)
++    : service_(service) {}
++
++ContainersHandler::~ContainersHandler() = default;
++
++void ContainersHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "getContainersInfo",
++      base::BindRepeating(&ContainersHandler::HandleGetContainersInfo,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "addContainer", base::BindRepeating(&ContainersHandler::HandleAddContainer,
++                                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "updateContainer",
++      base::BindRepeating(&ContainersHandler::HandleUpdateContainer,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "removeContainer",
++      base::BindRepeating(&ContainersHandler::HandleRemoveContainer,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "moveContainer",
++      base::BindRepeating(&ContainersHandler::HandleMoveContainer,
++                          base::Unretained(this)));
++}
++
++void ContainersHandler::OnJavascriptAllowed() {
++  observation_.Observe(service_.get());
++}
++
++void ContainersHandler::OnJavascriptDisallowed() {
++  observation_.Reset();
++}
++
++void ContainersHandler::OnContainersChanged() {
++  FireWebUIListener("containers-changed", GetContainersList());
++}
++
++void ContainersHandler::HandleGetContainersInfo(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0],
++                            base::DictValue()
++                                .Set("containers", GetContainersList())
++                                .Set("colors", GetColorsList()));
++}
++
++void ContainersHandler::HandleAddContainer(const base::ListValue& args) {
++  const std::string* name = args[0].GetIfString();
++  std::optional<containers::mojom::Color> color = ColorFromValue(args[1]);
++  if (name && color) {
++    // The page only sends valid names and colors.
++    std::ignore = service_->AddContainer(
++        containers::mojom::Container::New(std::string(), *name, *color));
++  }
++}
++
++void ContainersHandler::HandleUpdateContainer(const base::ListValue& args) {
++  const std::string* id = args[0].GetIfString();
++  const std::string* name = args[1].GetIfString();
++  std::optional<containers::mojom::Color> color = ColorFromValue(args[2]);
++  if (id && name && color) {
++    service_->UpdateContainer(
++        containers::mojom::Container::New(*id, *name, *color));
++  }
++}
++
++void ContainersHandler::HandleRemoveContainer(const base::ListValue& args) {
++  if (const std::string* id = args[0].GetIfString()) {
++    service_->RemoveContainer(*id);
++  }
++}
++
++void ContainersHandler::HandleMoveContainer(const base::ListValue& args) {
++  const std::string* id = args[0].GetIfString();
++  if (id && args[1].is_int() && args[1].GetInt() >= 0) {
++    service_->MoveContainer(*id, args[1].GetInt());
++  }
++}
++
++base::ListValue ContainersHandler::GetContainersList() const {
++  base::ListValue list;
++  for (const containers::mojom::ContainerPtr& container :
++       service_->GetContainers()) {
++    list.Append(base::DictValue()
++                    .Set("id", container->id)
++                    .Set("name", container->name)
++                    .Set("color", static_cast<int>(container->color)));
++  }
++  return list;
++}
++
++base::ListValue ContainersHandler::GetColorsList() {
++  // The page shows each color as it is drawn in menus, for the current theme.
++  const ui::ColorProvider& color_provider =
++      web_ui()->GetWebContents()->GetColorProvider();
++  const tab_groups::ColorLabelMap& labels =
++      tab_groups::GetTabGroupColorLabelMap();
++  base::ListValue list;
++  for (containers::mojom::Color color : kColors) {
++    const tab_groups::TabGroupColorId tab_group_color =
++        containers::GetTabGroupColorId(color);
++    list.Append(
++        base::DictValue()
++            .Set("value", static_cast<int>(color))
++            .Set("label", labels.at(tab_group_color))
++            .Set("cssColor",
++                 color_utils::SkColorToRgbaString(color_provider.GetColor(
++                     GetTabGroupContextMenuColorId(tab_group_color)))));
++  }
++  return list;
++}
++
++}  // namespace settings
+--- /dev/null
++++ b/chrome/browser/ui/webui/settings/containers_handler.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_CONTAINERS_HANDLER_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_CONTAINERS_HANDLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
++#include "components/containers/core/browser/containers_service.h"
++
++namespace settings {
++
++// Handles the containers settings page: lists, adds, edits, removes and
++// reorders the containers of a profile.
++class ContainersHandler : public SettingsPageUIHandler,
++                          public containers::ContainersService::Observer {
++ public:
++  explicit ContainersHandler(containers::ContainersService* service);
++  ContainersHandler(const ContainersHandler&) = delete;
++  ContainersHandler& operator=(const ContainersHandler&) = delete;
++  ~ContainersHandler() override;
++
++  // SettingsPageUIHandler:
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override;
++  void OnJavascriptDisallowed() override;
++
++  // containers::ContainersService::Observer:
++  void OnContainersChanged() override;
++
++ private:
++  void HandleGetContainersInfo(const base::ListValue& args);
++  void HandleAddContainer(const base::ListValue& args);
++  void HandleUpdateContainer(const base::ListValue& args);
++  void HandleRemoveContainer(const base::ListValue& args);
++  void HandleMoveContainer(const base::ListValue& args);
++
++  base::ListValue GetContainersList() const;
++  base::ListValue GetColorsList();
++
++  raw_ptr<containers::ContainersService> service_;
++  base::ScopedObservation<containers::ContainersService,
++                          containers::ContainersService::Observer>
++      observation_{this};
++};
++
++}  // namespace settings
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_CONTAINERS_HANDLER_H_
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browser_process_platform_part.h"
++#include "chrome/browser/containers/containers_service_factory.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/contextual_cueing/features.h"
+ #include "chrome/browser/file_system_access/chrome_file_system_access_permission_context.h"
+@@ -2442,6 +2443,14 @@ void AddPeopleStrings(content::WebUIData
+   static constexpr webui::LocalizedString kLocalizedStrings[] = {
+       // Top level people strings:
+       {"peoplePageTitle", IDS_PROFILES_MENU_NAME},
++      {"profilesSectionTitle", IDS_PROFILES_MENU_NAME},
++      {"containersTitle", IDS_SETTINGS_CONTAINERS},
++      {"containersDescription", IDS_SETTINGS_CONTAINERS_DESCRIPTION},
++      {"containersEmpty", IDS_SETTINGS_CONTAINERS_EMPTY},
++      {"containersAddTitle", IDS_SETTINGS_CONTAINERS_ADD_TITLE},
++      {"containersEditTitle", IDS_SETTINGS_CONTAINERS_EDIT_TITLE},
++      {"containersName", IDS_SETTINGS_CONTAINERS_NAME},
++      {"containersColor", IDS_SETTINGS_CONTAINERS_COLOR},
+       {"syncSettingsSavedToast", IDS_SETTINGS_SYNC_SETTINGS_SAVED_TOAST_LABEL},
+       {"manageGoogleAccount", IDS_SETTINGS_MANAGE_GOOGLE_ACCOUNT},
+       {"syncAndNonPersonalizedServices",
+@@ -2550,6 +2559,16 @@ void AddPeopleStrings(content::WebUIData
+   html_source->AddBoolean("profileShortcutsEnabled",
+                           ProfileShortcutManager::IsFeatureEnabled());
+ 
++  // Containers have their own section on this page, so it is named after
++  // both.
++  const bool containers_available =
++      containers::ContainersServiceFactory::GetForProfile(profile) != nullptr;
++  html_source->AddBoolean("heliumContainersAvailable", containers_available);
++  if (containers_available) {
++    html_source->AddLocalizedString("peoplePageTitle",
++                                    IDS_SETTINGS_PROFILES_AND_CONTAINERS);
++  }
++
+ #if BUILDFLAG(ENABLE_DICE_SUPPORT)
+   auto* profile_entry =
+       g_browser_process->profile_manager()
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/commerce/shopping_service_factory.h"
+ #include "chrome/browser/compose/compose_enabling.h"
++#include "chrome/browser/containers/containers_service_factory.h"
+ #include "chrome/browser/contextual_cueing/features.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_context_service.h"
+ #include "chrome/browser/dictation/dictation_keyed_service.h"
+@@ -68,6 +69,7 @@
+ #include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
+ #include "chrome/browser/ui/webui/settings/browser_lifetime_handler.h"
+ #include "chrome/browser/ui/webui/settings/browser_shortcuts_handler.h"
++#include "chrome/browser/ui/webui/settings/containers_handler.h"
+ #include "chrome/browser/ui/webui/settings/dictation_handler.h"
+ #include "chrome/browser/ui/webui/settings/downloads_handler.h"
+ #include "chrome/browser/ui/webui/settings/font_handler.h"
+@@ -505,6 +507,12 @@ SettingsUI::SettingsUI(content::WebUI* w
+   html_source->AddBoolean(
+       "isRelatedWebsiteSetsUiEnabled",
+       base::FeatureList::IsEnabled(privacy_sandbox::kRelatedWebsiteSetsUi));
++  if (containers::ContainersService* containers_service =
++          containers::ContainersServiceFactory::GetForProfile(profile)) {
++    AddSettingsPageUIHandler(
++        std::make_unique<ContainersHandler>(containers_service));
++  }
++
+   // Performance
+   AddSettingsPageUIHandler(std::make_unique<PerformanceHandler>());
+   html_source->AddBoolean(
+--- /dev/null
++++ b/chrome/browser/resources/settings/people_page/containers_browser_proxy.ts
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++
++export interface Container {
++  id: string;
++  name: string;
++  color: number;
++}
++
++// A color a container can have, as shown for the current theme.
++export interface ContainerColor {
++  value: number;
++  label: string;
++  cssColor: string;
++}
++
++export interface ContainersInfo {
++  containers: Container[];
++  colors: ContainerColor[];
++}
++
++export interface ContainersBrowserProxy {
++  getContainersInfo(): Promise<ContainersInfo>;
++  addContainer(name: string, color: number): void;
++  updateContainer(id: string, name: string, color: number): void;
++  removeContainer(id: string): void;
++  moveContainer(id: string, newIndex: number): void;
++}
++
++export class ContainersBrowserProxyImpl implements ContainersBrowserProxy {
++  getContainersInfo(): Promise<ContainersInfo> {
++    return sendWithPromise('getContainersInfo');
++  }
++
++  addContainer(name: string, color: number) {
++    chrome.send('addContainer', [name, color]);
++  }
++
++  updateContainer(id: string, name: string, color: number) {
++    chrome.send('updateContainer', [id, name, color]);
++  }
++
++  removeContainer(id: string) {
++    chrome.send('removeContainer', [id]);
++  }
++
++  moveContainer(id: string, newIndex: number) {
++    chrome.send('moveContainer', [id, newIndex]);
++  }
++
++  static getInstance(): ContainersBrowserProxy {
++    return instance || (instance = new ContainersBrowserProxyImpl());
++  }
++
++  static setInstance(obj: ContainersBrowserProxy) {
++    instance = obj;
++  }
++}
++
++let instance: ContainersBrowserProxy|null = null;
+--- a/chrome/browser/resources/settings/people_page/people_page.html.ts
++++ b/chrome/browser/resources/settings/people_page/people_page.html.ts
+@@ -10,7 +10,7 @@ import type {SettingsPeoplePageElement}
+ 
+ export function getHtml(this: SettingsPeoplePageElement) {
+   return html`<!--_html_template_start_-->
+-<settings-section page-title="$i18n{peoplePageTitle}">
++<settings-section page-title="$i18n{profilesSectionTitle}">
+       <div>
+ 
+ <if expr="not is_chromeos">
+@@ -73,6 +73,12 @@ export function getHtml(this: SettingsPe
+       </div>
+     </settings-section>
+ 
++    ${this.heliumContainersAvailable_ ? html`
++      <settings-section page-title="$i18n{containersTitle}">
++        <settings-containers-section></settings-containers-section>
++      </settings-section>
++    ` : ''}
++
+ <if expr="not is_chromeos">
+     ${this.showSignoutDialog_ ? html`
+       <settings-signout-dialog .syncStatus="${this.syncStatus}"
+--- a/chrome/browser/resources/settings/people_page/people_page.ts
++++ b/chrome/browser/resources/settings/people_page/people_page.ts
+@@ -14,6 +14,7 @@ import 'chrome://resources/cr_elements/c
+ import 'chrome://resources/cr_elements/icons.html.js';
+ import 'chrome://resources/cr_elements/policy/cr_policy_indicator.js';
+ import '../controls/settings_toggle_button.js';
++import './containers_section.js';
+ // <if expr="not is_chromeos">
+ import './sync_account_control.js';
+ // </if>
+@@ -139,6 +140,8 @@ export class SettingsPeoplePageElement e
+       showImportDataDialog_: {type: Boolean},
+       showSignoutDialog_: {type: Boolean},
+       // </if>
++
++      heliumContainersAvailable_: {type: Boolean},
+     };
+   }
+ 
+@@ -165,6 +168,9 @@ export class SettingsPeoplePageElement e
+   protected accessor showSignoutDialog_: boolean = false;
+   // </if>
+ 
++  protected accessor heliumContainersAvailable_: boolean =
++      loadTimeData.getBoolean('heliumContainersAvailable');
++
+   private syncBrowserProxy_: SyncBrowserProxy =
+       SyncBrowserProxyImpl.getInstance();
+ 
+--- /dev/null
++++ b/chrome/browser/resources/settings/people_page/containers_section.html
+@@ -0,0 +1,120 @@
++<!-- Copyright 2026 The Helium Authors
++     You can use, redistribute, and/or modify this source code under
++     the terms of the GPL-3.0 license that can be found in the LICENSE file. -->
++
++<style include="cr-shared-style settings-shared">
++  /* The page has no section heading to indent under, so line the rows up
++     with the description instead. */
++  .list-frame {
++    padding-inline-start: var(--cr-section-padding);
++  }
++
++  .color-dot {
++    border-radius: 50%;
++    flex-shrink: 0;
++    height: 12px;
++    margin-inline-end: 16px;
++    width: 12px;
++  }
++
++  #colorLabel {
++    margin-top: 16px;
++  }
++
++  /* Room for the selected color's outline, which the dialog would clip. */
++  #colors {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 12px;
++    margin: 4px -4px 0;
++    padding: 4px;
++  }
++
++  .color-option {
++    border: none;
++    border-radius: 50%;
++    cursor: pointer;
++    height: 24px;
++    padding: 0;
++    width: 24px;
++  }
++
++  .color-option[aria-checked='true'] {
++    outline: 2px solid var(--cr-focus-outline-color);
++    outline-offset: 2px;
++  }
++</style>
++
++<div class="cr-row first">
++  <div class="flex cr-padded-text cr-secondary-text">
++    $i18n{containersDescription}
++  </div>
++  <cr-button id="addButton" on-click="onAddClick_">
++    $i18n{add}
++  </cr-button>
++</div>
++
++<div class="list-frame" hidden="[[containers_.length]]">
++  <div class="list-item secondary">$i18n{containersEmpty}</div>
++</div>
++<div class="list-frame vertical-list" role="list"
++    hidden="[[!containers_.length]]">
++  <template is="dom-repeat" items="[[containers_]]">
++    <div class="list-item" role="listitem">
++      <span class="color-dot"
++          style$="background-color: [[getCssColor_(item.color, colors_)]]">
++      </span>
++      <div class="flex text-elide">[[item.name]]</div>
++      <cr-icon-button iron-icon="cr:keyboard-arrow-up"
++          title="$i18n{moveUp}" disabled="[[!index]]"
++          on-click="onMoveUpClick_">
++      </cr-icon-button>
++      <cr-icon-button iron-icon="cr:keyboard-arrow-down"
++          title="$i18n{moveDown}"
++          disabled="[[isLast_(index, containers_.length)]]"
++          on-click="onMoveDownClick_">
++      </cr-icon-button>
++      <cr-icon-button class="icon-edit" title="$i18n{edit}"
++          on-click="onEditClick_">
++      </cr-icon-button>
++      <cr-icon-button class="icon-delete-gray" title="$i18n{remove}"
++          on-click="onRemoveClick_">
++      </cr-icon-button>
++    </div>
++  </template>
++</div>
++
++<template is="dom-if" if="[[showDialog_]]" restamp>
++  <cr-dialog id="dialog" show-on-attach on-close="onDialogClose_">
++    <div slot="title">[[dialogTitle_]]</div>
++    <div slot="body">
++      <cr-input id="nameInput" label="$i18n{containersName}"
++          value="{{dialogName_}}" maxlength="100" autofocus
++          on-keydown="onNameKeydown_">
++      </cr-input>
++      <div id="colorLabel" class="cr-form-field-label">
++        $i18n{containersColor}
++      </div>
++      <div id="colors" role="radiogroup" aria-labelledby="colorLabel">
++        <template is="dom-repeat" items="[[colors_]]">
++          <button class="color-option" role="radio" title="[[item.label]]"
++              aria-label$="[[item.label]]"
++              aria-checked$="[[getColorChecked_(item.value, dialogColor_)]]"
++              style$="background-color: [[item.cssColor]]"
++              on-click="onColorClick_">
++          </button>
++        </template>
++      </div>
++    </div>
++    <div slot="button-container">
++      <cr-button class="cancel-button" on-click="onDialogCancel_">
++        $i18n{cancel}
++      </cr-button>
++      <cr-button id="saveButton" class="action-button"
++          on-click="onDialogSave_"
++          disabled="[[isSaveDisabled_(dialogName_)]]">
++        $i18n{save}
++      </cr-button>
++    </div>
++  </cr-dialog>
++</template>
+--- /dev/null
++++ b/chrome/browser/resources/settings/people_page/containers_section.ts
+@@ -0,0 +1,192 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import 'chrome://resources/cr_elements/cr_button/cr_button.js';
++import 'chrome://resources/cr_elements/cr_dialog/cr_dialog.js';
++import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
++import 'chrome://resources/cr_elements/cr_input/cr_input.js';
++import 'chrome://resources/cr_elements/cr_shared_style.css.js';
++import 'chrome://resources/cr_elements/icons.html.js';
++import '../settings_shared.css.js';
++
++import type {CrDialogElement} from 'chrome://resources/cr_elements/cr_dialog/cr_dialog.js';
++import {WebUiListenerMixin} from 'chrome://resources/cr_elements/web_ui_listener_mixin.js';
++import type {DomRepeatEvent} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
++import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
++
++import {loadTimeData} from '../i18n_setup.js';
++
++import type {Container, ContainerColor, ContainersBrowserProxy} from './containers_browser_proxy.js';
++import {ContainersBrowserProxyImpl} from './containers_browser_proxy.js';
++import {getTemplate} from './containers_section.html.js';
++
++// The list of containers shown in its own section of the Profiles page.
++const SettingsContainersSectionElementBase = WebUiListenerMixin(PolymerElement);
++
++export class SettingsContainersSectionElement extends
++    SettingsContainersSectionElementBase {
++  static get is() {
++    return 'settings-containers-section';
++  }
++
++  static get template() {
++    return getTemplate();
++  }
++
++  static get properties() {
++    return {
++      containers_: {
++        type: Array,
++        value: () => [],
++      },
++
++      colors_: {
++        type: Array,
++        value: () => [],
++      },
++
++      showDialog_: {
++        type: Boolean,
++        value: false,
++      },
++
++      dialogTitle_: String,
++      dialogName_: String,
++      dialogColor_: Number,
++    };
++  }
++
++  declare private containers_: Container[];
++  declare private colors_: ContainerColor[];
++  declare private showDialog_: boolean;
++  declare private dialogTitle_: string;
++  declare private dialogName_: string;
++  declare private dialogColor_: number;
++
++  private browserProxy_: ContainersBrowserProxy =
++      ContainersBrowserProxyImpl.getInstance();
++
++  // Container the edit dialog is for. Null while adding a container.
++  private activeContainer_: Container|null = null;
++
++  override connectedCallback() {
++    super.connectedCallback();
++
++    this.browserProxy_.getContainersInfo().then(info => {
++      this.containers_ = info.containers;
++      this.colors_ = info.colors;
++    });
++    this.addWebUiListener(
++        'containers-changed',
++        (containers: Container[]) => this.containers_ = containers);
++  }
++
++  private getCssColor_(color: number): string {
++    const match = this.colors_.find(c => c.value === color);
++    return match ? match.cssColor : '';
++  }
++
++  // A boolean binding would set aria-checked to "" instead of "true".
++  private getColorChecked_(color: number, selectedColor: number): string {
++    return color === selectedColor ? 'true' : 'false';
++  }
++
++  private isSaveDisabled_(name: string): boolean {
++    return !name || !name.trim();
++  }
++
++  private getDialog_(): CrDialogElement {
++    return this.shadowRoot!.querySelector<CrDialogElement>('#dialog')!;
++  }
++
++  private openDialog_(title: string, name: string, color: number) {
++    this.dialogTitle_ = title;
++    this.dialogName_ = name;
++    this.dialogColor_ = color;
++    this.showDialog_ = true;
++  }
++
++  private onAddClick_() {
++    this.activeContainer_ = null;
++    // Like a new tab group, suggest the least used color, earliest in the
++    // list on ties.
++    const usage = new Map<number, number>();
++    for (const container of this.containers_) {
++      usage.set(container.color, (usage.get(container.color) ?? 0) + 1);
++    }
++    let color = 0;
++    let minUsage = Infinity;
++    for (const {value} of this.colors_) {
++      const count = usage.get(value) ?? 0;
++      if (count < minUsage) {
++        color = value;
++        minUsage = count;
++      }
++    }
++    this.openDialog_(
++        loadTimeData.getString('containersAddTitle'), '', color);
++  }
++
++  private isLast_(index: number, length: number): boolean {
++    return index === length - 1;
++  }
++
++  private onEditClick_(e: DomRepeatEvent<Container>) {
++    const container = e.model.item;
++    this.activeContainer_ = container;
++    this.openDialog_(
++        loadTimeData.getString('containersEditTitle'), container.name,
++        container.color);
++  }
++
++  private onMoveUpClick_(e: DomRepeatEvent<Container>) {
++    this.browserProxy_.moveContainer(e.model.item.id, e.model.index - 1);
++  }
++
++  private onMoveDownClick_(e: DomRepeatEvent<Container>) {
++    this.browserProxy_.moveContainer(e.model.item.id, e.model.index + 1);
++  }
++
++  private onRemoveClick_(e: DomRepeatEvent<Container>) {
++    this.browserProxy_.removeContainer(e.model.item.id);
++  }
++
++  private onColorClick_(e: DomRepeatEvent<ContainerColor>) {
++    this.dialogColor_ = e.model.item.value;
++  }
++
++  private onNameKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter' && !this.isSaveDisabled_(this.dialogName_)) {
++      this.onDialogSave_();
++    }
++  }
++
++  private onDialogCancel_() {
++    this.getDialog_().cancel();
++  }
++
++  private onDialogSave_() {
++    const name = this.dialogName_.trim();
++    if (this.activeContainer_) {
++      this.browserProxy_.updateContainer(
++          this.activeContainer_.id, name, this.dialogColor_);
++    } else {
++      this.browserProxy_.addContainer(name, this.dialogColor_);
++    }
++    this.getDialog_().close();
++  }
++
++  private onDialogClose_() {
++    this.showDialog_ = false;
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-containers-section': SettingsContainersSectionElement;
++  }
++}
++
++customElements.define(
++    SettingsContainersSectionElement.is, SettingsContainersSectionElement);
