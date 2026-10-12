@@ -1,0 +1,185 @@
+--- a/chrome/browser/containers/containers_tab_util.h
++++ b/chrome/browser/containers/containers_tab_util.h
+@@ -17,6 +17,7 @@ class CommandLine;
+ }
+ 
+ namespace content {
++class SiteInstance;
+ class WebContents;
+ }
+ 
+@@ -39,6 +40,12 @@ std::optional<content::StoragePartitionC
+ GetStoragePartitionConfigForCommandLine(Profile* profile,
+                                         const base::CommandLine& command_line);
+ 
++// Returns the container StoragePartition of `source`, which a new tab opened
++// from a link in `source` should use. Returns nullopt if `source` doesn't
++// belong to a container.
++std::optional<content::StoragePartitionConfig>
++GetContainerStoragePartitionToInherit(content::SiteInstance* source);
++
+ // Must be called for every WebContents created for a new tab. If it belongs
+ // to a container, remembers the container on the tab and records the
+ // container as used.
+--- a/chrome/browser/containers/containers_tab_util.cc
++++ b/chrome/browser/containers/containers_tab_util.cc
+@@ -17,6 +17,7 @@
+ #include "components/containers/core/browser/containers_service.h"
+ #include "components/containers/core/common/features.h"
+ #include "content/public/browser/browser_context.h"
++#include "content/public/browser/site_instance.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ 
+@@ -63,6 +64,22 @@ GetStoragePartitionConfigForCommandLine(
+   return config;
+ }
+ 
++std::optional<content::StoragePartitionConfig>
++GetContainerStoragePartitionToInherit(content::SiteInstance* source) {
++  if (!base::FeatureList::IsEnabled(features::kHeliumContainers)) {
++    return std::nullopt;
++  }
++
++  content::StoragePartition* partition =
++      source->GetBrowserContext()->GetStoragePartition(source,
++                                                       /*can_create=*/false);
++  if (!partition ||
++      !GetContainerIdFromStoragePartitionConfig(partition->GetConfig())) {
++    return std::nullopt;
++  }
++  return partition->GetConfig();
++}
++
+ void OnTabContentsCreated(content::WebContents* contents) {
+   if (!base::FeatureList::IsEnabled(features::kHeliumContainers)) {
+     return;
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -565,11 +565,20 @@ std::unique_ptr<content::WebContents> Cr
+   // subsequent navigation is cross-process (i.e. cross-SiteInstance), then it
+   // will stay in the same BrowsingInstance (creating frame proxies as needed)
+   // preserving the requested opener relationship along the way.
++  //
++  // Tabs opened from a link in a container tab stay in that container.
++  std::optional<content::StoragePartitionConfig> storage_partition_config =
++      params.storage_partition_config;
++  if (!storage_partition_config && params.source_site_instance) {
++    storage_partition_config =
++        containers::GetContainerStoragePartitionToInherit(
++            params.source_site_instance.get());
++  }
+   scoped_refptr<content::SiteInstance> initial_site_instance_for_new_contents =
+       params.opener ? params.opener->GetSiteInstance()
+                     : tab_util::GetSiteInstanceForNewTab(
+                           params.browser->GetProfile(), url,
+-                          params.storage_partition_config);
++                          storage_partition_config);
+ 
+   WebContents::CreateParams create_params(
+       params.browser->GetProfile(), initial_site_instance_for_new_contents);
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -1182,6 +1182,13 @@ class CONTENT_EXPORT ContentBrowserClien
+       BrowserContext* browser_context,
+       const GURL& site);
+ 
++  // Allows the embedder to keep a window opened with "noopener" in the fixed
++  // StoragePartition of the frame that opened it. By default such a window
++  // uses the default StoragePartition, unless the opener is a guest.
++  virtual bool ShouldInheritFixedStoragePartitionForNoopenerWindow(
++      BrowserContext* browser_context,
++      const StoragePartitionConfig& partition_config);
++
+   // Allows the embedder to provide settings that determine if generated code
+   // can be cached and the amount of disk space used for caching generated code.
+   virtual GeneratedCodeCacheSettings GetGeneratedCodeCacheSettings(
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -785,6 +785,12 @@ StoragePartitionConfig ContentBrowserCli
+   return StoragePartitionConfig::CreateDefault(browser_context);
+ }
+ 
++bool ContentBrowserClient::ShouldInheritFixedStoragePartitionForNoopenerWindow(
++    BrowserContext* browser_context,
++    const StoragePartitionConfig& partition_config) {
++  return false;
++}
++
+ MediaObserver* ContentBrowserClient::GetMediaObserver() {
+   return nullptr;
+ }
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -5696,6 +5696,13 @@ FrameTree* WebContentsImpl::CreateNewWin
+       // as long as they preserve the guest's StoragePartition.
+       site_instance =
+           SiteInstance::CreateForGuest(GetBrowserContext(), partition_config);
++    } else if (source_site_instance->IsFixedStoragePartition() &&
++               GetContentClient()
++                   ->browser()
++                   ->ShouldInheritFixedStoragePartitionForNoopenerWindow(
++                       GetBrowserContext(), partition_config)) {
++      site_instance = SiteInstance::CreateForFixedStoragePartition(
++          GetBrowserContext(), GURL(), partition_config);
+     } else {
+       site_instance = SiteInstance::Create(GetBrowserContext());
+     }
+--- a/chrome/browser/chrome_content_browser_client.h
++++ b/chrome/browser/chrome_content_browser_client.h
+@@ -195,6 +195,9 @@ class ChromeContentBrowserClient : publi
+   content::StoragePartitionConfig GetStoragePartitionConfigForSite(
+       content::BrowserContext* browser_context,
+       const GURL& site) override;
++  bool ShouldInheritFixedStoragePartitionForNoopenerWindow(
++      content::BrowserContext* browser_context,
++      const content::StoragePartitionConfig& partition_config) override;
+   std::unique_ptr<content::WebContentsViewDelegate> GetWebContentsViewDelegate(
+       content::WebContents* web_contents) override;
+   void RenderProcessWillLaunch(content::RenderProcessHost* host) override;
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -244,6 +244,7 @@
+ #include "components/autofill/core/common/autofill_switches.h"
+ #include "components/blocked_content/popup_blocker.h"
+ #include "components/captive_portal/core/buildflags.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
+ #include "components/content_settings/browser/page_specific_content_settings.h"
+ #include "components/content_settings/browser/ui/javascript_optimizer_setting.h"
+ #include "components/content_settings/core/browser/content_settings_utils.h"
+@@ -1840,6 +1841,15 @@ ChromeContentBrowserClient::GetStoragePa
+   return default_storage_partition_config;
+ }
+ 
++bool ChromeContentBrowserClient::
++    ShouldInheritFixedStoragePartitionForNoopenerWindow(
++        content::BrowserContext* browser_context,
++        const content::StoragePartitionConfig& partition_config) {
++  // Links opened from a container tab stay in that container.
++  return containers::GetContainerIdFromStoragePartitionConfig(partition_config)
++      .has_value();
++}
++
+ std::unique_ptr<content::WebContentsViewDelegate>
+ ChromeContentBrowserClient::GetWebContentsViewDelegate(
+     content::WebContents* web_contents) {
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1136,6 +1136,7 @@ source_set("core") {
+     "//components/commerce/core:feature_list",
+     "//components/commerce/core/internals/mojom:mojo_bindings",
+     "//components/compose/core/browser:features",
++    "//components/containers/content/browser",
+     "//components/containers/core/common",
+     "//components/content_capture/browser",
+     "//components/content_settings/browser",
+--- a/chrome/browser/DEPS
++++ b/chrome/browser/DEPS
+@@ -109,6 +109,7 @@ include_rules = [
+   "+components/compose",
+   "+components/consent_auditor",
+   "+components/constrained_window",
++  "+components/containers/content/browser",
+   "+components/containers/core",
+   "+components/content_capture/browser",
+   "+components/content_capture/common",
