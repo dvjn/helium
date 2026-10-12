@@ -1,0 +1,299 @@
+--- /dev/null
++++ b/chrome/browser/containers/containers_browsertest.cc
+@@ -0,0 +1,248 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/test/scoped_feature_list.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/containers/containers_tab_util.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/common/features.h"
++#include "components/content_settings/core/common/content_settings_types.h"
++#include "components/permissions/permission_util.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_test.h"
++#include "content/public/test/browser_test_utils.h"
++#include "net/dns/mock_host_resolver.h"
++#include "net/test/embedded_test_server/embedded_test_server.h"
++#include "net/test/embedded_test_server/http_request.h"
++#include "net/test/embedded_test_server/http_response.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace containers {
++
++namespace {
++
++// Serves the same empty page for every path, so the tests don't depend on
++// test data files.
++std::unique_ptr<net::test_server::HttpResponse> ServeEmptyPage(
++    const net::test_server::HttpRequest& request) {
++  auto response = std::make_unique<net::test_server::BasicHttpResponse>();
++  response->set_content_type("text/html");
++  response->set_content("<!doctype html><title>page</title>");
++  return response;
++}
++
++}  // namespace
++
++class ContainersBrowserTest : public InProcessBrowserTest {
++ public:
++  void SetUpOnMainThread() override {
++    InProcessBrowserTest::SetUpOnMainThread();
++    host_resolver()->AddRule("*", "127.0.0.1");
++    embedded_test_server()->RegisterRequestHandler(
++        base::BindRepeating(&ServeEmptyPage));
++    ASSERT_TRUE(embedded_test_server()->Start());
++  }
++
++ protected:
++  GURL GetURL(const std::string& host) {
++    return embedded_test_server()->GetURL(host, "/");
++  }
++
++  ContainersService* service() {
++    return ContainersServiceFactory::GetForProfile(browser()->profile());
++  }
++
++  std::string GetContainerId(const std::string& name) {
++    for (const mojom::ContainerPtr& container : service()->GetContainers()) {
++      if (container->name == name) {
++        return container->id;
++      }
++    }
++    ADD_FAILURE() << "No container named " << name;
++    return std::string();
++  }
++
++  // Opens `url` in a new foreground tab in the container named `name`.
++  content::WebContents* OpenInContainer(const GURL& url,
++                                        const std::string& name) {
++    NavigateParams params(browser(), url, ui::PAGE_TRANSITION_LINK);
++    params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++    params.storage_partition_config =
++        FindContainerStoragePartition(browser()->profile(), name);
++    EXPECT_TRUE(params.storage_partition_config);
++    ui_test_utils::NavigateToURL(&params);
++    return params.navigated_or_inserted_contents;
++  }
++
++  // Opens `url` in a new foreground tab outside any container.
++  content::WebContents* OpenUncontained(const GURL& url) {
++    ui_test_utils::NavigateToURLWithDisposition(
++        browser(), url, WindowOpenDisposition::NEW_FOREGROUND_TAB,
++        ui_test_utils::BROWSER_TEST_WAIT_FOR_LOAD_STOP);
++    return browser()->tab_strip_model()->GetActiveWebContents();
++  }
++
++  // Runs `script` in `contents` and returns the tab it opened, once loaded.
++  content::WebContents* OpenTabFromScript(content::WebContents* contents,
++                                          const std::string& script) {
++    ui_test_utils::TabAddedWaiter waiter(browser());
++    EXPECT_TRUE(content::ExecJs(contents, script));
++    content::WebContents* new_contents = waiter.Wait();
++    EXPECT_TRUE(content::WaitForLoadStop(new_contents));
++    return new_contents;
++  }
++
++  std::string GetCookies(content::WebContents* contents) {
++    return content::EvalJs(contents, "document.cookie").ExtractString();
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_{features::kHeliumContainers};
++};
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, StarterContainersExist) {
++  ASSERT_TRUE(service());
++  std::vector<std::string> names;
++  for (const mojom::ContainerPtr& container : service()->GetContainers()) {
++    names.push_back(container->name);
++  }
++  EXPECT_EQ((std::vector<std::string>{"Personal", "Work", "Banking",
++                                      "Shopping"}),
++            names);
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, OpensTabInContainer) {
++  content::WebContents* contents = OpenInContainer(GetURL("a.test"), "Work");
++  ASSERT_TRUE(contents);
++
++  EXPECT_EQ(GetContainerId("Work"), GetContainerIdForWebContents(contents));
++  EXPECT_FALSE(GetContainerIdForWebContents(OpenUncontained(GetURL("a.test"))));
++
++  // Opening the tab records the container as used.
++  std::vector<mojom::ContainerPtr> used = service()->GetUsedContainers();
++  ASSERT_EQ(1u, used.size());
++  EXPECT_EQ(GetContainerId("Work"), used[0]->id);
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, CookiesAreIsolated) {
++  const GURL url = GetURL("a.test");
++  content::WebContents* work = OpenInContainer(url, "Work");
++  ASSERT_TRUE(content::ExecJs(work, "document.cookie = 'who=work'"));
++
++  EXPECT_EQ("", GetCookies(OpenInContainer(url, "Personal")));
++  EXPECT_EQ("", GetCookies(OpenUncontained(url)));
++
++  // Another tab in the same container shares the cookie jar.
++  EXPECT_EQ("who=work", GetCookies(OpenInContainer(url, "Work")));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, LocalStorageIsIsolated) {
++  const GURL url = GetURL("a.test");
++  content::WebContents* work = OpenInContainer(url, "Work");
++  ASSERT_TRUE(content::ExecJs(work, "localStorage.setItem('who', 'work')"));
++
++  const char kRead[] = "localStorage.getItem('who') ?? ''";
++  EXPECT_EQ("", content::EvalJs(OpenInContainer(url, "Personal"), kRead));
++  EXPECT_EQ("", content::EvalJs(OpenUncontained(url), kRead));
++  EXPECT_EQ("work", content::EvalJs(OpenInContainer(url, "Work"), kRead));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, NavigationsStayInContainer) {
++  content::WebContents* contents = OpenInContainer(GetURL("a.test"), "Work");
++
++  // A cross-site navigation in the same tab swaps the SiteInstance, but must
++  // keep the container.
++  ASSERT_TRUE(content::NavigateToURL(contents, GetURL("b.test")));
++  EXPECT_EQ(GetContainerId("Work"), GetContainerIdForWebContents(contents));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, LinkInNewTabInheritsContainer) {
++  content::WebContents* work = OpenInContainer(GetURL("a.test"), "Work");
++
++  // Middle-click, Ctrl+click and "Open link in new tab" all open the link in
++  // a new tab with the source frame's SiteInstance.
++  NavigateParams params(browser(), GetURL("b.test"), ui::PAGE_TRANSITION_LINK);
++  params.disposition = WindowOpenDisposition::NEW_BACKGROUND_TAB;
++  params.source_contents = work;
++  params.source_site_instance = work->GetPrimaryMainFrame()->GetSiteInstance();
++  ui_test_utils::NavigateToURL(&params);
++
++  ASSERT_TRUE(params.navigated_or_inserted_contents);
++  EXPECT_EQ(GetContainerId("Work"),
++            GetContainerIdForWebContents(params.navigated_or_inserted_contents));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, PopupInheritsContainer) {
++  content::WebContents* work = OpenInContainer(GetURL("a.test"), "Work");
++  content::WebContents* popup = OpenTabFromScript(
++      work, content::JsReplace("window.open($1, '_blank')", GetURL("b.test")));
++  EXPECT_EQ(GetContainerId("Work"), GetContainerIdForWebContents(popup));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, NoopenerPopupInheritsContainer) {
++  content::WebContents* work = OpenInContainer(GetURL("a.test"), "Work");
++  ASSERT_TRUE(content::ExecJs(work, "document.cookie = 'who=work'"));
++
++  content::WebContents* popup = OpenTabFromScript(
++      work, content::JsReplace("window.open($1, '_blank', 'noopener')",
++                               GetURL("a.test")));
++  EXPECT_EQ(GetContainerId("Work"), GetContainerIdForWebContents(popup));
++  EXPECT_EQ("who=work", GetCookies(popup));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, UncontainedPopupStaysUncontained) {
++  content::WebContents* contents = OpenUncontained(GetURL("a.test"));
++  content::WebContents* popup = OpenTabFromScript(
++      contents, content::JsReplace("window.open($1, '_blank', 'noopener')",
++                                   GetURL("b.test")));
++  EXPECT_FALSE(GetContainerIdForWebContents(popup));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, NewTabCommandDoesNotInherit) {
++  OpenInContainer(GetURL("a.test"), "Work");
++
++  ui_test_utils::TabAddedWaiter waiter(browser());
++  chrome::ExecuteCommand(browser(), IDC_NEW_TAB);
++  EXPECT_FALSE(GetContainerIdForWebContents(waiter.Wait()));
++}
++
++IN_PROC_BROWSER_TEST_F(ContainersBrowserTest, NotificationsAreNotBlocked) {
++  const GURL url = GetURL("a.test");
++  content::WebContents* work = OpenInContainer(url, "Work");
++
++  EXPECT_FALSE(permissions::PermissionUtil::IsPermissionBlockedInPartition(
++      ContentSettingsType::NOTIFICATIONS, url,
++      work->GetPrimaryMainFrame()->GetProcess()));
++}
++
++// Containers are opt-in: with the feature at its default (disabled) state there
++// is no service, and nothing can be opened in a container.
++using ContainersDisabledBrowserTest = InProcessBrowserTest;
++
++IN_PROC_BROWSER_TEST_F(ContainersDisabledBrowserTest, NoService) {
++  EXPECT_FALSE(ContainersServiceFactory::GetForProfile(browser()->profile()));
++  EXPECT_FALSE(FindContainerStoragePartition(browser()->profile(), "Work"));
++}
++
++}  // namespace containers
+--- a/chrome/browser/containers/BUILD.gn
++++ b/chrome/browser/containers/BUILD.gn
+@@ -25,3 +25,35 @@ source_set("containers") {
+     "//ui/base",
+   ]
+ }
++
++if (!is_android) {
++  source_set("browser_tests") {
++    testonly = true
++    defines = [ "HAS_OUT_OF_PROC_TEST_RUNNER" ]
++    sources = [ "containers_browsertest.cc" ]
++
++    deps = [
++      ":containers",
++      "//base",
++      "//base/test:test_support",
++      "//chrome/app:command_ids",
++      "//chrome/browser/profiles:profile",
++      "//chrome/browser/ui",
++      "//chrome/browser/ui/navigator",
++      "//chrome/browser/ui/tabs:tab_strip",
++      "//chrome/test:test_support",
++      "//chrome/test:test_support_ui",
++      "//components/containers/content/browser",
++      "//components/containers/core/browser",
++      "//components/containers/core/common",
++      "//components/content_settings/core/common",
++      "//components/permissions",
++      "//content/public/browser",
++      "//content/test:test_support",
++      "//net:test_support",
++      "//testing/gtest",
++      "//ui/base",
++      "//url",
++    ]
++  }
++}
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -1715,6 +1715,7 @@ if (!is_android) {
+       "//chrome/browser/collaboration",
+       "//chrome/browser/component_updater",
+       "//chrome/browser/component_updater:browser_tests",
++      "//chrome/browser/containers:browser_tests",
+       "//chrome/browser/content_extraction",
+       "//chrome/browser/content_extraction:browser_tests",
+       "//chrome/browser/content_index:browser_tests",
