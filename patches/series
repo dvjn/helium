@@ -374,3 +374,4 @@ helium/ui/hide-page-actions-flag.patch
 helium/containers/add-containers-flag.patch
 helium/containers/add-containers-service.patch
 helium/containers/add-containers-web-contents-utils.patch
+helium/containers/open-tabs-in-containers.patch

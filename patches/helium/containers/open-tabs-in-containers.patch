@@ -1,0 +1,339 @@
+--- /dev/null
++++ b/chrome/browser/containers/containers_tab_util.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_CONTAINERS_CONTAINERS_TAB_UTIL_H_
++#define CHROME_BROWSER_CONTAINERS_CONTAINERS_TAB_UTIL_H_
++
++#include <optional>
++#include <string_view>
++
++#include "content/public/browser/storage_partition_config.h"
++
++class Profile;
++
++namespace base {
++class CommandLine;
++}
++
++namespace content {
++class WebContents;
++}
++
++namespace containers {
++
++// Opens the URLs given on the command line in a container, selected by id or
++// by name (case-insensitive), e.g. --container=Work.
++inline constexpr char kContainerSwitch[] = "container";
++
++// Returns the StoragePartition config of the container in `profile` whose id
++// or name (case-insensitive) is `id_or_name`. Returns nullopt if containers
++// are unavailable for `profile` or no such container exists.
++std::optional<content::StoragePartitionConfig> FindContainerStoragePartition(
++    Profile* profile,
++    std::string_view id_or_name);
++
++// Returns the StoragePartition config for the container named by
++// --container on `command_line`, if any.
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigForCommandLine(Profile* profile,
++                                        const base::CommandLine& command_line);
++
++// Must be called for every WebContents created for a new tab. If it belongs
++// to a container, remembers the container on the tab and records the
++// container as used.
++void OnTabContentsCreated(content::WebContents* contents);
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_CONTAINERS_CONTAINERS_TAB_UTIL_H_
+--- /dev/null
++++ b/chrome/browser/containers/containers_tab_util.cc
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/containers/containers_tab_util.h"
++
++#include <string>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/feature_list.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/common/features.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/web_contents.h"
++
++namespace containers {
++
++std::optional<content::StoragePartitionConfig> FindContainerStoragePartition(
++    Profile* profile,
++    std::string_view id_or_name) {
++  ContainersService* service = ContainersServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return std::nullopt;
++  }
++
++  mojom::ContainerPtr container = service->GetContainer(id_or_name);
++  if (!container) {
++    for (mojom::ContainerPtr& candidate : service->GetContainers()) {
++      if (base::EqualsCaseInsensitiveASCII(candidate->name, id_or_name)) {
++        container = std::move(candidate);
++        break;
++      }
++    }
++  }
++  if (!container) {
++    return std::nullopt;
++  }
++
++  return GetStoragePartitionConfigForContainer(profile, container->id);
++}
++
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigForCommandLine(Profile* profile,
++                                        const base::CommandLine& command_line) {
++  if (!command_line.HasSwitch(kContainerSwitch)) {
++    return std::nullopt;
++  }
++
++  const std::string value = command_line.GetSwitchValueUTF8(kContainerSwitch);
++  std::optional<content::StoragePartitionConfig> config =
++      FindContainerStoragePartition(profile, value);
++  if (!config) {
++    LOG(WARNING) << "Ignoring --" << kContainerSwitch << "=" << value
++                 << ": no such container";
++  }
++  return config;
++}
++
++void OnTabContentsCreated(content::WebContents* contents) {
++  if (!base::FeatureList::IsEnabled(features::kHeliumContainers)) {
++    return;
++  }
++
++  const content::StoragePartitionConfig& config =
++      contents->GetBrowserContext()
++          ->GetStoragePartition(contents->GetSiteInstance())
++          ->GetConfig();
++  std::optional<std::string> container_id =
++      GetContainerIdFromStoragePartitionConfig(config);
++  if (!container_id) {
++    return;
++  }
++
++  SetContainerIdForWebContents(contents, *container_id);
++
++  ContainersService* service = ContainersServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(contents->GetBrowserContext()));
++  if (!service) {
++    return;
++  }
++  if (mojom::ContainerPtr container = service->GetContainer(*container_id)) {
++    service->MarkContainerUsed(*container);
++  }
++}
++
++}  // namespace containers
+--- a/chrome/browser/ui/navigator/browser_navigator_params.h
++++ b/chrome/browser/ui/navigator/browser_navigator_params.h
+@@ -24,6 +24,7 @@
+ #include "content/public/browser/reload_type.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "content/public/common/referrer.h"
+ #include "services/network/public/cpp/resource_request_body.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -338,6 +339,11 @@ struct NavigateParams {
+   // Optional URLLoaderFactory to facilitate blob URL loading.
+   scoped_refptr<network::SharedURLLoaderFactory> blob_url_loader_factory;
+ 
++  // If set, a new WebContents created for this navigation is bound to this
++  // StoragePartition for its whole lifetime. Used to open tabs in containers.
++  // Ignored when an existing tab is navigated or when |opener| is set.
++  std::optional<content::StoragePartitionConfig> storage_partition_config;
++
+   // Indicates that this is a service worker openWindow() call targeting a new
+   // window.
+   bool is_service_worker_open_window = false;
+--- a/chrome/browser/tab_contents/tab_util.h
++++ b/chrome/browser/tab_contents/tab_util.h
+@@ -5,7 +5,10 @@
+ #ifndef CHROME_BROWSER_TAB_CONTENTS_TAB_UTIL_H_
+ #define CHROME_BROWSER_TAB_CONTENTS_TAB_UTIL_H_
+ 
++#include <optional>
++
+ #include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "url/gurl.h"
+ 
+ class Profile;
+@@ -13,8 +16,13 @@ class Profile;
+ namespace tab_util {
+ 
+ // Returns a new SiteInstance for WebUI and app URLs. Returns NULL otherwise.
+-scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(Profile* profile,
+-                                                              GURL url);
++// If `storage_partition_config` is set, always returns a SiteInstance that is
++// fixed to that StoragePartition.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    Profile* profile,
++    GURL url,
++    const std::optional<content::StoragePartitionConfig>&
++        storage_partition_config = std::nullopt);
+ 
+ }  // namespace tab_util
+ 
+--- a/chrome/browser/tab_contents/tab_util.cc
++++ b/chrome/browser/tab_contents/tab_util.cc
+@@ -19,8 +19,11 @@ using content::SiteInstance;
+ 
+ namespace tab_util {
+ 
+-scoped_refptr<SiteInstance> GetSiteInstanceForNewTab(Profile* profile,
+-                                                     GURL url) {
++scoped_refptr<SiteInstance> GetSiteInstanceForNewTab(
++    Profile* profile,
++    GURL url,
++    const std::optional<content::StoragePartitionConfig>&
++        storage_partition_config) {
+   // Rewrite the |url| if necessary, to ensure that the SiteInstance is
+   // associated with a |url| that will actually be loaded.  For example,
+   // |url| set to chrome://newtab/ might actually result in a navigation to a
+@@ -28,6 +31,13 @@ scoped_refptr<SiteInstance> GetSiteInsta
+   content::BrowserURLHandler::GetInstance()->RewriteURLIfNecessary(&url,
+                                                                    profile);
+ 
++  // A fixed StoragePartition must be chosen up front: the tab keeps it for
++  // every later navigation, whatever the URL.
++  if (storage_partition_config) {
++    return SiteInstance::CreateForFixedStoragePartition(
++        profile, url, *storage_partition_config);
++  }
++
+   // If |url| is a WebUI or extension, we set the SiteInstance up front so that
+   // we don't end up with an extra process swap on the first navigation.
+   if (ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(profile, url))
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -47,6 +47,7 @@ source_set("impl") {
+     "//chrome/browser:browser_about_handler",
+     "//chrome/browser:browser_public_dependencies",
+     "//chrome/browser:primitives",
++    "//chrome/browser/containers",
+     "//chrome/browser/picture_in_picture",
+     "//chrome/browser/prefs",
+     "//chrome/browser/profiles:profile",
+--- /dev/null
++++ b/chrome/browser/containers/DEPS
+@@ -0,0 +1,3 @@
++include_rules = [
++  "+components/containers",
++]
+--- a/chrome/browser/containers/BUILD.gn
++++ b/chrome/browser/containers/BUILD.gn
+@@ -8,17 +8,21 @@ source_set("containers") {
+     "container_color.h",
+     "containers_service_factory.cc",
+     "containers_service_factory.h",
++    "containers_tab_util.cc",
++    "containers_tab_util.h",
+   ]
+ 
+   public_deps = [
+     "//chrome/browser/profiles:profile",
+     "//components/containers/core/mojom",
+     "//components/tab_groups",
++    "//content/public/browser",
+   ]
+ 
+   deps = [
+     "//base",
+     "//chrome/app:generated_resources",
++    "//components/containers/content/browser",
+     "//components/containers/core/browser",
+     "//components/containers/core/common",
+     "//components/keyed_service/core",
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -23,6 +23,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/platform_apps/install_chrome_app.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/containers/containers_tab_util.h"
+ #include "chrome/browser/custom_handlers/protocol_handler_registry_factory.h"
+ #include "chrome/browser/defaults.h"
+ #include "chrome/browser/first_run/first_run.h"
+@@ -389,6 +390,9 @@ BrowserWindowInterface* StartupBrowserCr
+ 
+   bool first_tab = true;
+   bool process_headless_commands = headless::ShouldProcessHeadlessCommands();
++  const std::optional<content::StoragePartitionConfig> container_partition =
++      containers::GetStoragePartitionConfigForCommandLine(profile_,
++                                                          *command_line_);
+   custom_handlers::ProtocolHandlerRegistry* registry =
+       ProtocolHandlerRegistryFactory::GetForBrowserContext(profile_);
+   for (auto& tab : tabs) {
+@@ -477,6 +481,7 @@ BrowserWindowInterface* StartupBrowserCr
+     params.disposition = first_tab ? WindowOpenDisposition::NEW_FOREGROUND_TAB
+                                    : WindowOpenDisposition::NEW_BACKGROUND_TAB;
+     params.tabstrip_add_types = add_types;
++    params.storage_partition_config = container_partition;
+ 
+ #if BUILDFLAG(ENABLE_RLZ)
+     if (process_startup == chrome::startup::IsProcessStartup::kYes &&
+--- a/chrome/browser/ui/startup/BUILD.gn
++++ b/chrome/browser/ui/startup/BUILD.gn
+@@ -226,6 +226,7 @@ source_set("impl") {
+       "//chrome/browser/app_mode",
+       "//chrome/browser/apps/app_service",
+       "//chrome/browser/apps/platform_apps",
++      "//chrome/browser/containers",
+       "//chrome/browser/custom_handlers",
+       "//chrome/browser/extensions",
+       "//chrome/browser/headless:command_processor",
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/apps/link_capturing/link_capturing_tab_data.h"
+ #include "chrome/browser/browser_about_handler.h"
++#include "chrome/browser/containers/containers_tab_util.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/prefs/incognito_mode_prefs.h"
+@@ -567,7 +568,8 @@ std::unique_ptr<content::WebContents> Cr
+   scoped_refptr<content::SiteInstance> initial_site_instance_for_new_contents =
+       params.opener ? params.opener->GetSiteInstance()
+                     : tab_util::GetSiteInstanceForNewTab(
+-                          params.browser->GetProfile(), url);
++                          params.browser->GetProfile(), url,
++                          params.storage_partition_config);
+ 
+   WebContents::CreateParams create_params(
+       params.browser->GetProfile(), initial_site_instance_for_new_contents);
+@@ -589,7 +591,10 @@ std::unique_ptr<content::WebContents> Cr
+   }
+ #endif
+ 
+-  return WebContents::Create(create_params);
++  std::unique_ptr<content::WebContents> contents =
++      WebContents::Create(create_params);
++  containers::OnTabContentsCreated(contents.get());
++  return contents;
+ }
+ 
+ }  // namespace
