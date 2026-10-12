@@ -1,0 +1,50 @@
+--- a/components/permissions/BUILD.gn
++++ b/components/permissions/BUILD.gn
+@@ -135,6 +135,7 @@ source_set("permissions") {
+   deps = [
+     "//base",
+     "//components/back_forward_cache",
++    "//components/containers/content/browser",
+     "//components/content_settings/browser",
+     "//components/content_settings/core/browser",
+     "//components/content_settings/core/browser:cookie_settings",
+--- a/components/permissions/DEPS
++++ b/components/permissions/DEPS
+@@ -1,5 +1,6 @@
+ include_rules = [
+   "+components/back_forward_cache",
++  "+components/containers/content/browser",
+   "+components/content_settings/browser",
+   "+components/content_settings/core",
+   "+components/favicon/core",
+--- a/components/permissions/permission_util.cc
++++ b/components/permissions/permission_util.cc
+@@ -14,6 +14,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
+ #include "build/build_config.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+ #include "components/content_settings/core/common/content_settings_utils.h"
+@@ -28,6 +29,7 @@
+ #include "content/public/browser/permission_result.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
++#include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_features.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom.h"
+@@ -688,6 +690,12 @@ bool PermissionUtil::IsPermissionBlocked
+       content::StoragePartition* requesting_home_partition =
+           render_process_host->GetBrowserContext()->GetStoragePartitionForUrl(
+               requesting_origin);
++      // Container tabs share the profile's permissions with regular tabs.
++      if (requesting_home_partition->GetConfig().is_default() &&
++          containers::GetContainerIdFromStoragePartitionConfig(
++              render_process_host->GetStoragePartition()->GetConfig())) {
++        return false;
++      }
+       return requesting_home_partition !=
+              render_process_host->GetStoragePartition();
+   }
